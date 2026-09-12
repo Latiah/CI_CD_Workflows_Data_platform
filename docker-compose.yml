@@ -1,0 +1,355 @@
+name: mini-data-platform
+
+# ---------------------------------------------------------------------------
+# Shared Airflow definition. Every Airflow container (init, scheduler,
+# webserver, triggerer) runs the same image and the same configuration.
+# ---------------------------------------------------------------------------
+x-airflow-common: &airflow-common
+  build:
+    context: .
+    dockerfile: docker/airflow/Dockerfile
+  image: ${IMAGE_REGISTRY:-mini-data-platform}/airflow:${IMAGE_TAG:-local}
+  env_file:
+    - path: .env
+      required: false
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:-ZmRfcGxhdGZvcm1fZGVtb19mZXJuZXRfa2V5XzEyMzQ=}
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: >-
+      postgresql+psycopg2://${POSTGRES_USER:-platform}:${POSTGRES_PASSWORD:-platform}@postgres:5432/airflow
+
+    # The Flask-AppBuilder login ships as a provider rather than in core, so it
+    # has to be named explicitly. Left unset, Airflow uses the simple auth
+    # manager and ignores the admin credentials below.
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+
+    # Task code reaches Airflow through the Task Execution API served by the
+    # api-server, never the metadata database directly. Even under LocalExecutor,
+    # where tasks run as scheduler subprocesses, they need this URL to fetch
+    # connections and report state — which is why the scheduler waits for the
+    # api-server to be healthy before starting.
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-apiserver:8080/execution/
+
+    # Signs the api-server's session cookies.
+    AIRFLOW__API__SECRET_KEY: ${AIRFLOW_SECRET_KEY:-mini-data-platform-secret}
+    # Signs the JWTs task processes use against the Execution API. Every
+    # component that mints or validates one must agree on it, which is why it
+    # lives in the shared block.
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET:-mini-data-platform-jwt-secret}
+
+    # Parsing DAGs over a Docker Desktop bind mount is slow on a cold start with
+    # no __pycache__, and a timeout surfaces confusingly as "DagBag import
+    # timeout" rather than as slow I/O.
+    AIRFLOW__CORE__DAGBAG_IMPORT_TIMEOUT: "120"
+    AIRFLOW__DAG_PROCESSOR__REFRESH_INTERVAL: "15"
+    PYTHONPATH: /opt/airflow/dags:/opt/airflow/src
+
+    # --- Connections injected as environment variables (no manual UI setup) ---
+    AIRFLOW_CONN_MINIO_DEFAULT: >-
+      {"conn_type": "aws",
+       "login": "${MINIO_ROOT_USER:-minioadmin}",
+       "password": "${MINIO_ROOT_PASSWORD:-minioadmin}",
+       "extra": {"endpoint_url": "http://minio:9000", "region_name": "us-east-1"}}
+    AIRFLOW_CONN_ANALYTICS_DB: >-
+      {"conn_type": "postgres",
+       "login": "${POSTGRES_USER:-platform}",
+       "password": "${POSTGRES_PASSWORD:-platform}",
+       "host": "postgres",
+       "port": 5432,
+       "schema": "${ANALYTICS_DB:-analytics}"}
+
+    # --- Pipeline tuning, read by the DAG ---
+    MINIO_BUCKET: ${MINIO_BUCKET:-raw-data}
+    MINIO_PREFIX: ${MINIO_PREFIX:-sales/}
+  volumes:
+    - ./dags:/opt/airflow/dags:ro
+    - ./src:/opt/airflow/src:ro
+    - airflow-logs:/opt/airflow/logs
+    - airflow-plugins:/opt/airflow/plugins
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on:
+    postgres:
+      condition: service_healthy
+    minio-init:
+      condition: service_completed_successfully
+  networks:
+    - data-platform
+
+services:
+  # -------------------------------------------------------------------------
+  # STORAGE (relational) — one Postgres instance hosting three logical DBs:
+  # airflow (metadata), analytics (warehouse), metabase (BI app state).
+  # -------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: mdp-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-platform}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-platform}
+      POSTGRES_DB: ${POSTGRES_DB:-platform}
+      ANALYTICS_DB: ${ANALYTICS_DB:-analytics}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./config/postgres/init:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-platform} -d ${POSTGRES_DB:-platform}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks:
+      - data-platform
+
+  # -------------------------------------------------------------------------
+  # STORAGE (object) — S3-compatible landing zone for raw CSV files.
+  # Pulled from quay.io, MinIO's own registry: the Docker Hub mirror is not
+  # reachable under Docker Desktop's default image-access policy.
+  # -------------------------------------------------------------------------
+  minio:
+    image: quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z
+    container_name: mdp-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    volumes:
+      - minio-data:/data
+    ports:
+      - "${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    networks:
+      - data-platform
+
+  # One-shot: create the raw bucket so Airflow never races an empty MinIO.
+  minio-init:
+    image: quay.io/minio/mc:RELEASE.2025-04-16T18-13-26Z
+    container_name: mdp-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      MINIO_BUCKET: ${MINIO_BUCKET:-raw-data}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        mc alias set local http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD"
+        mc mb --ignore-existing "local/$$MINIO_BUCKET"
+        mc mb --ignore-existing "local/$$MINIO_BUCKET-archive"
+        echo "MinIO buckets ready: $$MINIO_BUCKET, $$MINIO_BUCKET-archive"
+    networks:
+      - data-platform
+
+  # -------------------------------------------------------------------------
+  # PROCESSING — Airflow 3: init / api-server / scheduler / dag-processor /
+  # triggerer. Parsing is its own component in Airflow 3; without the
+  # dag-processor the DAG never appears at all.
+  # -------------------------------------------------------------------------
+  # Migration and the admin account are driven by the image's own entrypoint via
+  # the _AIRFLOW_* variables rather than an explicit `airflow users create`: that
+  # subcommand moved into the FAB provider in Airflow 3, and letting the
+  # entrypoint do it keeps this file off whichever spelling is current. Doing it
+  # in a one-shot service also stops the long-running components racing to
+  # migrate the same database on a cold start.
+  airflow-init:
+    <<: *airflow-common
+    container_name: mdp-airflow-init
+    command: version
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: "true"
+      _AIRFLOW_WWW_USER_CREATE: "true"
+      _AIRFLOW_WWW_USER_USERNAME: ${AIRFLOW_ADMIN_USER:-airflow}
+      _AIRFLOW_WWW_USER_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD:-airflow}
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # The UI, the REST API, and the Task Execution API that task processes call
+  # home to. First of the Airflow services to start; the others are useless
+  # without it.
+  airflow-apiserver:
+    <<: *airflow-common
+    container_name: mdp-airflow-apiserver
+    command: api-server
+    restart: unless-stopped
+    ports:
+      - "${AIRFLOW_PORT:-8080}:8080"
+    healthcheck:
+      # In Airflow 3 the health endpoint lives under /api/v2.
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/monitor/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 180s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: mdp-airflow-scheduler
+    command: scheduler
+    restart: unless-stopped
+    healthcheck:
+      # Asks Airflow whether this host's scheduler job is alive, rather than
+      # trusting the process is running — a wedged scheduler keeps its PID.
+      test: ["CMD-SHELL", 'airflow jobs check --job-type SchedulerJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 20s
+      retries: 5
+      start_period: 60s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+      airflow-init:
+        condition: service_completed_successfully
+      # Under LocalExecutor the scheduler runs the tasks, and an Airflow 3 task
+      # cannot start without the Execution API behind this service.
+      airflow-apiserver:
+        condition: service_healthy
+
+  # Parses dags/ and writes the serialised DAGs the scheduler reads.
+  airflow-dag-processor:
+    <<: *airflow-common
+    container_name: mdp-airflow-dag-processor
+    command: dag-processor
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type DagProcessorJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 20s
+      retries: 5
+      start_period: 180s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-triggerer:
+    <<: *airflow-common
+    container_name: mdp-airflow-triggerer
+    command: triggerer
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type TriggererJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 20s
+      retries: 5
+      start_period: 60s
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  # -------------------------------------------------------------------------
+  # INGESTION — synthetic data generator. Not part of the default `up`;
+  # run it on demand:  docker compose run --rm data-generator
+  # or continuously:   docker compose --profile generator up -d data-generator
+  # -------------------------------------------------------------------------
+  data-generator:
+    build:
+      context: .
+      dockerfile: docker/data_generator/Dockerfile
+    image: ${IMAGE_REGISTRY:-mini-data-platform}/data-generator:${IMAGE_TAG:-local}
+    container_name: mdp-data-generator
+    profiles: ["generator"]
+    environment:
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      MINIO_BUCKET: ${MINIO_BUCKET:-raw-data}
+      MINIO_PREFIX: ${MINIO_PREFIX:-sales/}
+    command: ["--rows", "2000", "--interval", "300"]
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+    networks:
+      - data-platform
+
+  # -------------------------------------------------------------------------
+  # VISUALIZATION — Metabase, pointed at the analytics database.
+  # -------------------------------------------------------------------------
+  metabase:
+    image: metabase/metabase:v0.54.6
+    container_name: mdp-metabase
+    restart: unless-stopped
+    environment:
+      MB_DB_TYPE: postgres
+      MB_DB_DBNAME: metabase
+      MB_DB_PORT: 5432
+      MB_DB_USER: ${POSTGRES_USER:-platform}
+      MB_DB_PASS: ${POSTGRES_PASSWORD:-platform}
+      MB_DB_HOST: postgres
+      JAVA_TIMEZONE: ${TZ:-UTC}
+    volumes:
+      - metabase-data:/plugins
+    ports:
+      - "${METABASE_PORT:-3000}:3000"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:3000/api/health"]
+      interval: 20s
+      timeout: 10s
+      retries: 15
+      start_period: 90s
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - data-platform
+
+  # One-shot: create the Metabase admin account and register the analytics
+  # database, so the BI layer needs no click-through setup.
+  #   docker compose --profile setup run --rm metabase-init
+  metabase-init:
+    image: python:3.12-slim
+    container_name: mdp-metabase-init
+    profiles: ["setup"]
+    environment:
+      METABASE_URL: http://metabase:3000
+      METABASE_ADMIN_EMAIL: ${METABASE_ADMIN_EMAIL:-admin@example.com}
+      METABASE_ADMIN_PASSWORD: ${METABASE_ADMIN_PASSWORD:-Metabase123!}
+      POSTGRES_HOST: postgres
+      POSTGRES_USER: ${POSTGRES_USER:-platform}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-platform}
+      ANALYTICS_DB: ${ANALYTICS_DB:-analytics}
+    volumes:
+      - ./scripts:/scripts:ro
+    command: ["python", "/scripts/setup_metabase.py"]
+    depends_on:
+      metabase:
+        condition: service_healthy
+    networks:
+      - data-platform
+
+volumes:
+  postgres-data:
+  minio-data:
+  metabase-data:
+  airflow-logs:
+  airflow-plugins:
+
+networks:
+  data-platform:
+    driver: bridge
