@@ -1,0 +1,6 @@
+# Dependencies for running the test suite outside the containers.
+pytest==8.3.4
+pandas==2.2.3
+boto3==1.35.92
+psycopg2-binary==2.9.10
+Faker==33.3.1
