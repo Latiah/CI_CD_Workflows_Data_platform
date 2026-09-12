@@ -1,0 +1,16 @@
+# Installed into the Airflow image and resolved against the official Airflow
+# 3.3.1 / Python 3.12 constraints file. Airflow itself is not listed: it comes
+# from the base image, so its version is pinned in exactly one place. Providers
+# are given as lower bounds so the constraints file picks the compatible pin.
+
+# MinIO is reached through the S3 API, so the AWS provider is what talks to it.
+apache-airflow-providers-amazon>=9.2.0
+apache-airflow-providers-postgres>=6.0.0
+
+# In Airflow 3 the username/password UI login moved out of core into this
+# provider. It must be installed for AIRFLOW__CORE__AUTH_MANAGER to resolve;
+# without it the api-server falls back to the simple auth manager and the admin
+# credentials are ignored.
+apache-airflow-providers-fab>=2.0.0
+
+pandas>=2.1.0
