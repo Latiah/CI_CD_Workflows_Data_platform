@@ -1,0 +1,36 @@
+# Secrets and local configuration
+.env
+*.env.local
+
+# Docker volumes and runtime state
+volumes/
+logs/
+plugins/
+data/
+*.pid
+
+# Airflow
+airflow.db
+airflow-webserver.cfg
+standalone_admin_password.txt
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Generated sample data
+*.csv
+!tests/**/fixtures/*.csv
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

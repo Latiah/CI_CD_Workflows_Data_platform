@@ -1,0 +1,33 @@
+[project]
+name = "mini-data-platform"
+version = "1.0.0"
+description = "Dockerised mini data platform: MinIO -> Airflow -> PostgreSQL -> Metabase"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+pythonpath = [".", "src"]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = [
+    "integration: end-to-end tests that need a running docker compose stack",
+]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+exclude = [".git", "__pycache__", "logs", "volumes"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM"]
+ignore = [
+    "E501",   # line length is handled by the formatter
+    "B008",   # Airflow decorators legitimately call in defaults
+]
+
+[tool.ruff.lint.per-file-ignores]
+"dags/*" = ["E402"]   # DAG modules import after path setup
+"tests/*" = ["E402", "S101"]
+
+[tool.ruff.format]
+quote-style = "double"
