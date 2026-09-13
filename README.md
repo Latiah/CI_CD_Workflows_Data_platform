@@ -1,5 +1,7 @@
 # Mini Data Platform (Dockerized)
 
+[![ci](https://github.com/Latiah/CI_CD_Workflows_Data_platform/actions/workflows/main.yml/badge.svg)](https://github.com/Latiah/CI_CD_Workflows_Data_platform/actions/workflows/main.yml)
+
 An end-to-end data platform run entirely by Docker Compose. Synthetic sales data
 lands in object storage, Airflow cleans and loads it into a relational
 warehouse, and Metabase charts the result — with CI/CD that proves the whole
@@ -209,15 +211,50 @@ then region and product breakdowns side by side.
 
 ## CI/CD
 
-[.github/workflows/main.yml](.github/workflows/main.yml) runs five jobs:
+[.github/workflows/main.yml](.github/workflows/main.yml) runs six jobs in two
+tiers, then deploys.
+
+**Fast tier** — no running services, so it fails in under two minutes:
 
 | Job | What it does |
 | :-- | :-- |
-| **lint** | Ruff check + format, hadolint on both Dockerfiles, `docker compose config` validation, SQL presence check |
-| **unit-tests** | Transform rules and DAG structure — no Docker needed |
-| **build-images** | Builds the Airflow and data-generator images in a matrix, with GHA layer caching, and pushes to GHCR on `main` |
-| **data-flow-validation** | Stands the real stack up and asserts data moves `MinIO → Airflow → PostgreSQL → Metabase` |
-| **deploy-test** | On `main`, deploys the validated images to the test environment over SSH and smoke-checks both health endpoints |
+| **lint** | `make lint` (ruff check + format, hadolint on both Dockerfiles) and `make validate` (compose config, SQL bootstrap) |
+| **unit** | `make test` — transform rules, no Docker needed |
+| **dags** | Builds the image's `test` stage and parses the DAG bag inside it |
+
+**Integration tier** — the real stack, end to end:
+
+| Job | What it does |
+| :-- | :-- |
+| **integration** | `compose up --wait` on the six core services, provisions Metabase, then `make e2e` asserts data moves `MinIO → Airflow → PostgreSQL → Metabase` |
+
+**Deployment** — only on a push to `main`:
+
+| Job | What it does |
+| :-- | :-- |
+| **publish** | Builds the `runtime` stage and pushes it to GHCR tagged `sha-<commit>`, with GHA layer caching |
+| **deploy-test** | Pulls that exact tag, deploys it with `--no-build`, and re-runs the integration suite against it |
+
+Three details worth knowing:
+
+**CI runs the same `make` targets you do.** Every job invokes `make <target>
+PY="python"` rather than raw commands, so a green `make lint test` locally means
+the pipeline ran identical commands. There is no second copy of the build recipe
+to drift out of sync.
+
+**`--wait` replaces a polling loop.** `compose up --wait --wait-timeout 600`
+blocks until every named service reports healthy and fails fast if one never
+gets there, instead of letting tests queue against a dead scheduler.
+
+**The deploy tests the artifact, not the source.** `publish` tags by commit sha,
+never `latest`, and `deploy-test` runs `--no-build` against that pulled image —
+so what gets smoke-tested is byte-for-byte what would ship. A mutable tag is how
+a pipeline goes green while the environment quietly runs older code.
+
+The `dags` job exists because
+[tests/unit/test_dag_integrity.py](tests/unit/test_dag_integrity.py) calls
+`pytest.importorskip("airflow")`: on a bare runner it would always skip, so it
+runs inside the image the scheduler actually uses and becomes a real check.
 
 ### Data flow validation
 
@@ -242,18 +279,30 @@ the full path against a live stack:
 
 ### Deployment configuration
 
-CD is inert until you set these in the repository:
+Publishing uses the built-in `GITHUB_TOKEN`, so nothing needs configuring for
+`publish` to work. `deploy-test` needs one thing:
 
-| Kind | Name | Example |
-| :-- | :-- | :-- |
-| Variable | `DEPLOY_HOST` | `test.example.com` |
-| Variable | `DEPLOY_USER` | `deploy` |
-| Variable | `DEPLOY_PATH` | `/opt/mini-data-platform` |
-| Variable | `TEST_ENV_URL` | `http://test.example.com` |
-| Secret | `DEPLOY_SSH_KEY` | private key for `DEPLOY_USER` |
+- A **`test` environment** under Settings → Environments. It can be empty; the
+  job references `environment: name: test` and fails immediately if it does not
+  exist. Adding required reviewers there turns the deploy into a gated release.
 
-Without them the job still runs, reports the published image tags, and tells you
-what to configure — so a fork never fails CI on missing infrastructure.
+Images land at `ghcr.io/<owner>/<repo>/airflow:sha-<commit>`. Make the package
+public, or grant the repository read access, if anything outside Actions needs
+to pull it.
+
+### When a run fails
+
+The `integration` job writes a summary table of service states to the run page
+and uploads a `compose-logs-<run_id>` artifact containing:
+
+- `compose.log` — every service's output
+- `ps.txt` — container states, including `oom=true/false` per container, since a
+  container killed for memory leaves nothing in its own log
+- `tasks.log` — the Airflow task logs from disk, which is where a task traceback
+  actually lands
+
+The suite also pulls a failed task's log into the pytest failure message itself,
+so the common case needs no artifact download at all.
 
 ---
 
@@ -278,19 +327,23 @@ interpreter: `make test PY=python3.12`.
 ## Repository structure
 
 ```text
-├── dags/                      # Airflow DAG definitions
+├── dags/                        # Airflow DAG definitions
 │   └── sales_ingestion_dag.py
-├── data_generator/            # Synthetic sales data generator
-├── src/pipeline/              # Transform + warehouse logic (Airflow-free, testable)
-├── config/postgres/init/      # Database and warehouse schema bootstrap
-├── docker/                    # Dockerfiles for the custom images
-├── scripts/                   # Metabase provisioning, secret generation
-├── requirements-dev.txt       # One toolchain for local and CI
-├── tests/unit/                # Transform rules and DAG integrity
-├── tests/integration/         # End-to-end data flow validation
-├── .github/workflows/main.yml # CI/CD pipeline
-├── docker-compose.yml         # Platform orchestration
-├── Makefile                   # Shortcuts for every common task
-└── .env.example               # Configuration template
+├── data_generator/              # Synthetic sales data generator
+├── src/pipeline/                # Transform + warehouse logic (Airflow-free, testable)
+├── config/postgres/init/        # Database and warehouse schema bootstrap
+├── docker/
+│   ├── airflow/Dockerfile       # runtime + test stages, both used by CI
+│   └── data_generator/Dockerfile
+├── scripts/
+│   ├── provision_metabase.py    # `python -m scripts.provision_metabase`
+│   └── gen_secrets.sh           # Replaces the placeholder secrets in .env
+├── tests/unit/                  # Transform rules and DAG integrity
+├── tests/integration/           # End-to-end data flow validation
+├── .github/workflows/main.yml   # CI/CD pipeline
+├── docker-compose.yml           # Platform orchestration
+├── Makefile                     # The entry point CI and humans share
+├── requirements-dev.txt         # One toolchain for local and CI
+└── .env.example                 # Configuration template
 ```
 
