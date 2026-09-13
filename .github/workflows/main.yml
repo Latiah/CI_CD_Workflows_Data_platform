@@ -249,7 +249,29 @@ jobs:
 
       - name: Dump logs on failure
         if: failure()
-        run: docker compose logs --tail=200
+        run: |
+          # Under LocalExecutor the scheduler runs the tasks, so a task
+          # traceback lands there - give it the most room.
+          echo "::group::airflow-scheduler"
+          docker compose logs --tail=400 airflow-scheduler || true
+          echo "::endgroup::"
+          for service in airflow-dag-processor airflow-apiserver minio postgres metabase; do
+            echo "::group::$service"
+            docker compose logs --tail=80 "$service" || true
+            echo "::endgroup::"
+          done
+          # Task logs are written to files, not stdout, so surface them directly.
+          echo "::group::task logs on disk"
+          docker compose exec -T airflow-scheduler \
+            bash -c 'find /opt/airflow/logs -name "*.log" -newermt "-30 minutes" -print -exec tail -n 60 {} \;' || true
+          echo "::endgroup::"
+          # Did any container get OOM-killed? That is invisible in the app logs.
+          echo "::group::container exit states"
+          docker compose ps -a
+          for c in $(docker compose ps -aq); do
+            docker inspect -f '{{.Name}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} status={{.State.Status}}' "$c" || true
+          done
+          echo "::endgroup::"
 
       - name: Upload test results
         if: always()

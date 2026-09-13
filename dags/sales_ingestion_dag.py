@@ -133,7 +133,11 @@ def sales_ingestion():
         return {"object_key": object_key, "rows_inserted": inserted, **summary}
 
     # -------------------------------------------------------------- report
-    @task(trigger_rule="all_done")
+    # none_failed, not all_done: a quiet cycle (process_file mapped over an empty
+    # list, so skipped) should still produce a summary, but a failed load must
+    # not be papered over. summarise is the only leaf task, so with all_done a
+    # failed process_file still left the DAG run marked "success".
+    @task(trigger_rule="none_failed")
     def summarise(results: list[dict]) -> dict:
         results = [r for r in results if r]
         totals = {

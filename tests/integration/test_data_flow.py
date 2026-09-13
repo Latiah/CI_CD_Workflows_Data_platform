@@ -94,6 +94,34 @@ def metabase_request(method: str, path: str, payload: dict | None = None, token:
     return json.loads(body) if body else {}
 
 
+def task_log(run_id: str, task: dict, tail: int = 60) -> str:
+    """Fetch a task instance's log so a CI failure explains itself.
+
+    Mapped tasks carry a map_index and live at a different path. Any failure to
+    retrieve the log is reported inline rather than raised - this runs while
+    another assertion is already failing and must not mask it.
+    """
+    task_id, try_number = task["task_id"], max(task.get("try_number") or 1, 1)
+    map_index = task.get("map_index", -1)
+    base = f"/api/v2/dags/{DAG_ID}/dagRuns/{run_id}/taskInstances/{task_id}"
+    path = f"{base}/{map_index}/logs/{try_number}" if map_index >= 0 else f"{base}/logs/{try_number}"
+
+    try:
+        payload = airflow_request("GET", f"{path}?full_content=true")
+    except Exception as exc:  # noqa: BLE001 - diagnostics only
+        return f"<could not fetch log for {task_id}[{map_index}]: {exc}>"
+
+    content = payload.get("content", payload)
+    if isinstance(content, list):
+        # Airflow 3 returns structured chunks; each may be a dict or a string.
+        text = "\n".join(c.get("event", str(c)) if isinstance(c, dict) else str(c) for c in content)
+    else:
+        text = str(content)
+
+    lines = [line for line in text.splitlines() if line.strip()]
+    return "\n".join(lines[-tail:])
+
+
 def http_json(url: str, timeout: int = 30) -> dict:
     with urllib.request.urlopen(url, timeout=timeout) as response:
         return json.loads(response.read().decode())
@@ -180,19 +208,19 @@ def dag_run(uploaded_batch):
     tasks = airflow_request("GET", f"/api/v2/dags/{DAG_ID}/dagRuns/{run_id}/taskInstances")
     states = [(t["task_id"], t["state"]) for t in tasks["task_instances"]]
 
-    if state != "success":
-        failed = [pair for pair in states if pair[1] == "failed"]
-        pytest.fail(f"DAG run {run_id} ended as {state}; task states: {states}; failed: {failed}")
-
-    # A run where every task skipped also reports "success". Without this check
-    # the suite reports a green pipeline that loaded nothing — which is exactly
-    # what happened when the scheduler was not running.
+    broken = [t for t in tasks["task_instances"] if t["state"] in {"failed", "up_for_retry"}]
+    # A run where every task skipped also reports "success", and a failed
+    # non-leaf task used to as well. Either way the pipeline loaded nothing, so
+    # report the task logs rather than just the states.
     processed = [s for task_id, s in states if task_id == "process_file" and s == "success"]
-    if not processed:
+
+    if state != "success" or broken or not processed:
+        logs = "\n\n".join(
+            f"----- {t['task_id']}[{t.get('map_index', -1)}] log -----\n{task_log(run_id, t)}" for t in broken
+        )
         pytest.fail(
-            f"DAG run {run_id} reported success but process_file never ran. "
-            f"Task states: {states}. The file was uploaded, so this means the DAG "
-            f"did not see it, or no scheduler was available to execute the task."
+            f"DAG run {run_id} ended as {state} and did not load the file.\n"
+            f"Task states: {states}\n\n{logs or '<no failed task instances to show>'}"
         )
     return run_id
 
@@ -298,12 +326,15 @@ def test_9_metabase_api_is_healthy_and_sees_the_warehouse():
     )
     assert health.get("status") == "ok"
 
-    properties = http_json(f"{METABASE_URL}/api/session/properties")
-    if properties.get("setup-token"):
-        pytest.skip("Metabase is not provisioned yet - run `make metabase` first")
+    # Decided by an actual login rather than by the setup-token property: that
+    # property is not a reliable "is provisioned" signal, and reading it wrong
+    # silently skipped this test in CI even though provisioning had succeeded.
+    try:
+        session = metabase_request("POST", "/api/session", {"username": MB_EMAIL, "password": MB_PASSWORD})
+    except urllib.error.HTTPError as exc:
+        pytest.skip(f"cannot sign in to Metabase ({exc.code}) - run `make metabase` to provision it")
 
-    # Log in and confirm the warehouse connection the pipeline feeds is registered.
-    token = metabase_request("POST", "/api/session", {"username": MB_EMAIL, "password": MB_PASSWORD})["id"]
+    token = session["id"]
     listing = metabase_request("GET", "/api/database", token=token)
     databases = listing.get("data", listing) if isinstance(listing, dict) else listing
 

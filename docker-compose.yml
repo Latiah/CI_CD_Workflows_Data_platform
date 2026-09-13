@@ -15,6 +15,15 @@ x-airflow-common: &airflow-common
   environment: &airflow-common-env
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
     AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+
+    # LocalExecutor pre-spawns one worker process per unit of parallelism, and
+    # the default is 32. Each worker is a full Python process holding Airflow
+    # (~150 MB), so the default costs roughly 4.5 GB before a single task runs —
+    # more than this stack's whole memory budget. The scheduler was being
+    # OOM-killed on startup, restarting, and spawning 32 workers again.
+    # Four is ample: the DAG maps at most 4 files concurrently.
+    AIRFLOW__CORE__PARALLELISM: "4"
+    AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG: "4"
     AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:-ZmRfcGxhdGZvcm1fZGVtb19mZXJuZXRfa2V5XzEyMzQ=}
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: >-
