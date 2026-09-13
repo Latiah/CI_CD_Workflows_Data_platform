@@ -38,11 +38,16 @@ jobs:
       - name: Ruff format check
         run: ruff format --check .
 
+      # `dockerfile` must be the literal filename to match against, not a glob:
+      # with recursive:true the action does `find . -name "$dockerfile"`, so a
+      # value like "docker/**/Dockerfile" never matches anything (find -name
+      # only compares basenames) and the step was passing without linting
+      # either docker/airflow/Dockerfile or docker/data_generator/Dockerfile.
       - name: Lint Dockerfiles (hadolint)
         uses: hadolint/hadolint-action@v3.1.0
         with:
           recursive: true
-          dockerfile: docker/**/Dockerfile
+          dockerfile: Dockerfile
           failure-threshold: error
 
       - name: Validate docker-compose.yml
@@ -87,12 +92,38 @@ jobs:
           path: unit-results.xml
 
   # ==========================================================================
-  # CI 3 — build the custom images and publish them to GHCR
+  # CI 3 — DAG integrity, exercised in the real Airflow image
+  #
+  # tests/unit/test_dag_integrity.py does `pytest.importorskip("airflow")` so
+  # it runs cleanly in the unit-tests job above even without Airflow
+  # installed - but that also means it always skips there, since the runner
+  # never has Airflow. This job builds the "test" stage of the Airflow image
+  # (same base, same providers, same DAG files) and runs that same test
+  # inside it, so DAG import/graph errors actually fail CI instead of being
+  # silently skipped.
+  # ==========================================================================
+  dag-integrity:
+    name: DAG integrity (in-container)
+    runs-on: ubuntu-latest
+    needs: [lint]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Airflow test image
+        run: docker build --target test -t airflow-test:ci -f docker/airflow/Dockerfile .
+
+      - name: Parse DAG bag
+        run: |
+          docker run --rm --entrypoint python airflow-test:ci \
+            -m pytest /opt/airflow/tests/unit/test_dag_integrity.py -v
+
+  # ==========================================================================
+  # CI 4 — build the custom images and publish them to GHCR
   # ==========================================================================
   build-images:
     name: Build ${{ matrix.service }} image
     runs-on: ubuntu-latest
-    needs: [lint, unit-tests]
+    needs: [lint, unit-tests, dag-integrity]
     permissions:
       contents: read
       packages: write
@@ -139,13 +170,13 @@ jobs:
           cache-to: type=gha,mode=max,scope=${{ matrix.service }}
 
   # ==========================================================================
-  # CI 4 — data flow validation:
+  # CI 5 — data flow validation:
   #        MinIO -> Airflow -> PostgreSQL -> Metabase, on a real stack
   # ==========================================================================
   data-flow-validation:
     name: Data flow validation (end-to-end)
     runs-on: ubuntu-latest
-    needs: [lint, unit-tests]
+    needs: [lint, unit-tests, dag-integrity]
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
