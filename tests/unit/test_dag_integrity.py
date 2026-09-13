@@ -32,8 +32,10 @@ def test_task_graph_matches_the_documented_flow(dagbag):
     dag = dagbag.dags[DAG_ID]
     task_ids = set(dag.task_ids)
 
-    assert {"wait_for_new_files", "list_new_files", "process_file", "summarise"} <= task_ids
-    assert dag.get_task("list_new_files").upstream_task_ids == {"wait_for_new_files"}
+    assert {"list_new_files", "process_file", "summarise"} <= task_ids
+    # list_new_files is the detector and the root of the graph.
+    assert dag.get_task("list_new_files").upstream_task_ids == set()
+    assert "list_new_files" in dag.get_task("process_file").upstream_task_ids
     assert "process_file" in dag.get_task("summarise").upstream_task_ids
 
 

@@ -43,7 +43,28 @@ x-airflow-common: &airflow-common
     # no __pycache__, and a timeout surfaces confusingly as "DagBag import
     # timeout" rather than as slow I/O.
     AIRFLOW__CORE__DAGBAG_IMPORT_TIMEOUT: "120"
-    AIRFLOW__DAG_PROCESSOR__REFRESH_INTERVAL: "15"
+
+    # Parsing is its own component in Airflow 3, so its knobs live under
+    # [dag_processor] rather than [scheduler].
+    AIRFLOW__DAG_PROCESSOR__DAG_FILE_PROCESSOR_TIMEOUT: "180"
+    # Re-parse every 5 minutes, not every 30 seconds. With a parse costing tens
+    # of seconds over the bind mount, the default leaves the processor parsing
+    # essentially non-stop and starves the other components of CPU. There is one
+    # DAG file here, so picking up an edit within five minutes is ample.
+    AIRFLOW__DAG_PROCESSOR__MIN_FILE_PROCESS_INTERVAL: "300"
+    # One DAG file, so a second parsing process only adds contention.
+    AIRFLOW__DAG_PROCESSOR__PARSING_PROCESSES: "1"
+
+    # Two api-server workers instead of the default: on a typical Docker Desktop
+    # allocation, more workers contend for memory and I/O without making a
+    # single-user local UI any faster.
+    AIRFLOW__API__WORKERS: "2"
+    # The default 120s assumes local-disk imports. DAGs and src/ arrive over a
+    # bind mount, markedly slower on macOS and Windows, so give the boot room
+    # rather than let a slow first import get killed and look like a crash —
+    # which surfaces as "container mdp-airflow-apiserver is unhealthy".
+    AIRFLOW__API__WORKER_TIMEOUT: "300"
+
     PYTHONPATH: /opt/airflow/dags:/opt/airflow/src
 
     # --- Connections injected as environment variables (no manual UI setup) ---
@@ -196,7 +217,10 @@ services:
       interval: 15s
       timeout: 10s
       retries: 10
-      start_period: 180s
+      # Longer than API__WORKER_TIMEOUT above, so a slow cold start is reported
+      # as "starting" rather than flipping the container to unhealthy and
+      # failing everything that depends on it.
+      start_period: 320s
     depends_on:
       postgres:
         condition: service_healthy
@@ -248,9 +272,16 @@ services:
       airflow-init:
         condition: service_completed_successfully
 
+  # The triggerer is deliberately not started by default: nothing in this DAG
+  # defers. The S3KeySensor runs in `reschedule` mode, which releases its slot
+  # between pokes without needing a triggerer, and on a small Docker allocation
+  # an idle Airflow component costs memory the rest of the stack needs.
+  # Add a deferrable operator (or a sensor with deferrable=True) and you need it:
+  #   docker compose --profile deferrable up -d airflow-triggerer
   airflow-triggerer:
     <<: *airflow-common
     container_name: mdp-airflow-triggerer
+    profiles: ["deferrable"]
     command: triggerer
     restart: unless-stopped
     healthcheck:
@@ -303,6 +334,9 @@ services:
       MB_DB_PASS: ${POSTGRES_PASSWORD:-platform}
       MB_DB_HOST: postgres
       JAVA_TIMEZONE: ${TZ:-UTC}
+      # Cap the heap. Left alone the JVM sizes itself against the host's total
+      # RAM and will happily take more than the rest of the stack has left.
+      JAVA_OPTS: -Xmx${METABASE_MAX_HEAP:-768m}
     volumes:
       - metabase-data:/plugins
     ports:

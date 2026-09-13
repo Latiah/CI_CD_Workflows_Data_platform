@@ -86,8 +86,12 @@ metadata database and creates the admin user through the image entrypoint;
 `airflow-apiserver` serves the UI, the REST API and the Task Execution API;
 `airflow-dag-processor` parses `dags/` into serialised DAGs (its own service in
 Airflow 3 — without it the DAG never appears); `airflow-scheduler` decides what
-runs and, under LocalExecutor, runs it; `airflow-triggerer` handles deferred
-work.
+runs and, under LocalExecutor, runs it.
+
+`airflow-triggerer` is defined but not started by default. Nothing here defers,
+and an idle Airflow component costs memory the rest of the stack needs. Add a
+deferrable operator and you need it:
+`docker compose --profile deferrable up -d airflow-triggerer`.
 
 **Startup ordering** — `depends_on` conditions plus health checks mean
 `airflow-scheduler` only starts after Postgres is accepting connections, the
@@ -121,16 +125,20 @@ python -m data_generator.generate --rows 20 --out - --seed 1   # preview locally
 [dags/sales_ingestion_dag.py](dags/sales_ingestion_dag.py) — DAG
 `sales_ingestion`, scheduled every 10 minutes:
 
-1. **`wait_for_new_files`** — an `S3KeySensor` in `reschedule` mode watches
-   `sales/*.csv` in MinIO, freeing its worker slot between pokes.
-2. **`list_new_files`** — lists the bucket and subtracts everything already
-   recorded in `ops.ingested_files`. Returns an empty list on a quiet cycle
-   rather than skipping, which keeps the mapped task's XCom resolvable so the
-   summary still runs.
-3. **`process_file`** — dynamically mapped over each new object (4 at a time):
+1. **`list_new_files`** — lists `sales/*.csv` in MinIO and subtracts everything
+   already recorded in `ops.ingested_files`. Returns an empty list on a quiet
+   cycle rather than skipping, which keeps the mapped task's XCom resolvable so
+   the summary still runs.
+2. **`process_file`** — dynamically mapped over each new object (4 at a time):
    download → clean → load → archive.
-4. **`summarise`** — totals the run, runs `ANALYZE` so Metabase queries hit
+3. **`summarise`** — totals the run, runs `ANALYZE` so Metabase queries hit
    fresh statistics, and logs a warehouse snapshot.
+
+An `S3KeySensor` sat in front of this and was removed. It cannot tell a new
+object from one already ingested, and with `soft_fail=True` a real failure —
+wrong endpoint, bad credentials — is recorded as a *skip*, which cascades
+downstream and leaves the DAG run green having loaded nothing. Listing the
+bucket answers the same question and fails loudly when MinIO is unreachable.
 
 The cleaning rules live in
 [src/pipeline/transform.py](src/pipeline/transform.py), deliberately free of
@@ -280,15 +288,35 @@ make smoke                    # up + provision + seed + validate, in one go
 
 ## Troubleshooting
 
+**`container mdp-airflow-apiserver is unhealthy`** — almost always memory, not
+configuration. The api-server imports the DAGs over a bind mount at boot; if
+Docker is starved that import exceeds `AIRFLOW__API__WORKER_TIMEOUT`, the worker
+is killed, and a slow start looks like a crash.
+
+This stack needs roughly **4 GB** of Docker memory. On Windows, WSL defaults to
+half the host's RAM — create `%USERPROFILE%\.wslconfig` with:
+
+```ini
+[wsl2]
+memory=5GB
+```
+
+then `wsl --shutdown` and restart Docker Desktop. Stopping other Compose
+projects first has the same effect. Lower `METABASE_MAX_HEAP` to claw back more.
+
 **Airflow logs are unwritable on Linux** — set `AIRFLOW_UID=$(id -u)` in `.env`
-and restart. (Not needed on Docker Desktop for Windows or macOS.)
+and restart. Not needed on Docker Desktop for Windows or macOS.
 
-**The DAG run is skipped** — that is the designed behaviour when nothing new is
-in MinIO. Run `make seed` first.
+**The DAG run does nothing** — that is correct when MinIO holds no new files.
+Run `make seed` first.
 
-**Metabase takes a while on first boot** — it migrates its application database;
-the health check allows 90 seconds of start-up before it begins counting
-failures. `docker compose logs -f metabase` shows progress.
+**The DAG never appears in the UI** — check the dag-processor, not the
+scheduler: `docker compose exec airflow-dag-processor airflow dags list-import-errors`.
+A DAG with an import error is simply absent; nothing fails loudly.
+
+**Metabase is slow on first boot** — it migrates its application database. The
+health check allows 90 seconds before it starts counting failures;
+`docker compose logs -f metabase` shows progress.
 
 **Port already in use** — override `POSTGRES_PORT`, `AIRFLOW_PORT`,
 `METABASE_PORT`, `MINIO_API_PORT` or `MINIO_CONSOLE_PORT` in `.env`, then point
@@ -299,10 +327,9 @@ AIRFLOW_URL=http://localhost:18080 METABASE_URL=http://localhost:13000 \
 MINIO_ENDPOINT=http://localhost:19000 POSTGRES_PORT=55432 pytest tests/integration -v
 ```
 
-**MinIO images come from `quay.io`, not Docker Hub** — that is deliberate.
-Docker Desktop's default image-access policy blocks the `minio/*` Docker Hub
-repositories; `quay.io/minio/*` is MinIO's own registry and pulls without
-authentication.
+**MinIO images come from `quay.io`, not Docker Hub** — deliberate. Docker
+Desktop's default image-access policy blocks the `minio/*` Docker Hub
+repositories; `quay.io/minio/*` is MinIO's own registry.
 
 **Start completely fresh** — `make clean` removes every volume, including the
-warehouse and Metabase's dashboards.
+warehouse and Metabase's saved questions.

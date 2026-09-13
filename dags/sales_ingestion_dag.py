@@ -17,7 +17,6 @@ import os
 from datetime import UTC, datetime, timedelta
 
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
-from airflow.providers.amazon.aws.sensors.s3 import S3KeySensor
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 
 # Airflow 3 moves the DAG authoring surface into the Task SDK; the old
@@ -56,22 +55,14 @@ DEFAULT_ARGS = {
     tags=["minio", "postgres", "etl", "sales"],
 )
 def sales_ingestion():
-    # ---------------------------------------------------------------- sense
-    # Reschedule mode frees the worker slot between pokes; soft_fail lets an
-    # empty bucket skip the run quietly instead of raising an alert.
-    wait_for_files = S3KeySensor(
-        task_id="wait_for_new_files",
-        aws_conn_id=AWS_CONN_ID,
-        bucket_name=BUCKET,
-        bucket_key=f"{PREFIX}*.csv",
-        wildcard_match=True,
-        mode="reschedule",
-        poke_interval=30,
-        timeout=60 * 8,
-        soft_fail=True,
-    )
-
-    # ----------------------------------------------------------------- list
+    # ------------------------------------------------------------ detect
+    # This task is the detector. An S3KeySensor was tried here first and
+    # removed: it cannot distinguish a genuinely new object from one already
+    # ingested, and with soft_fail=True a real failure (bad credentials, wrong
+    # endpoint) is reported as a skip, which cascades downstream and leaves the
+    # DAG run green with nothing loaded. Listing the bucket and subtracting
+    # ops.ingested_files answers the real question and fails loudly when it
+    # cannot reach MinIO.
     @task
     def list_new_files() -> list[str]:
         """Objects present in MinIO that Postgres has no ingestion record for."""
@@ -166,9 +157,7 @@ def sales_ingestion():
         LOG.info("Run summary at %s: %s", datetime.now(UTC).isoformat(), totals)
         return totals
 
-    new_files = list_new_files()
-    wait_for_files >> new_files
-    summarise(process_file.expand(object_key=new_files))
+    summarise(process_file.expand(object_key=list_new_files()))
 
 
 sales_ingestion()

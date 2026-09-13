@@ -177,10 +177,23 @@ def dag_run(uploaded_batch):
         return state if state in {"success", "failed"} else None
 
     state = wait_until(finished, timeout=DAG_RUN_TIMEOUT, interval=10, description=f"DAG run {run_id}")
+    tasks = airflow_request("GET", f"/api/v2/dags/{DAG_ID}/dagRuns/{run_id}/taskInstances")
+    states = [(t["task_id"], t["state"]) for t in tasks["task_instances"]]
+
     if state != "success":
-        tasks = airflow_request("GET", f"/api/v2/dags/{DAG_ID}/dagRuns/{run_id}/taskInstances")
-        failed = [(t["task_id"], t["state"]) for t in tasks["task_instances"] if t["state"] == "failed"]
-        pytest.fail(f"DAG run {run_id} ended as {state}; failed tasks: {failed}")
+        failed = [pair for pair in states if pair[1] == "failed"]
+        pytest.fail(f"DAG run {run_id} ended as {state}; task states: {states}; failed: {failed}")
+
+    # A run where every task skipped also reports "success". Without this check
+    # the suite reports a green pipeline that loaded nothing — which is exactly
+    # what happened when the scheduler was not running.
+    processed = [s for task_id, s in states if task_id == "process_file" and s == "success"]
+    if not processed:
+        pytest.fail(
+            f"DAG run {run_id} reported success but process_file never ran. "
+            f"Task states: {states}. The file was uploaded, so this means the DAG "
+            f"did not see it, or no scheduler was available to execute the task."
+        )
     return run_id
 
 
