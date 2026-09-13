@@ -1,23 +1,40 @@
 """DAG-level checks: the file must import, parse, and be wired the way we think.
 
-Skipped automatically when Airflow is not installed (e.g. a plain local venv),
-so the unit suite still runs everywhere.
+Skipped automatically when Airflow is not installed (a plain local venv), which
+is why CI also runs this file inside the Airflow image — see the `dag-integrity`
+job. There it is a real check rather than a silent skip.
 """
 
 from __future__ import annotations
+
+from pathlib import Path
 
 import pytest
 
 pytest.importorskip("airflow", reason="Airflow not installed in this environment")
 
-from airflow.models import DagBag  # noqa: E402
+try:
+    # Airflow 3: DagBag lives here. The airflow.models.dagbag path still imports
+    # but resolves to the DB-backed bag, whose __init__ takes different
+    # arguments entirely.
+    from airflow.dag_processing.dagbag import DagBag
+except ImportError:  # pragma: no cover - Airflow 2 fallback
+    from airflow.models.dagbag import DagBag
 
 DAG_ID = "sales_ingestion"
+
+# Resolved from this file rather than the cwd, so the same test works from the
+# repo root and from /opt/airflow inside the image.
+DAG_FOLDER = Path(__file__).resolve().parents[2] / "dags"
 
 
 @pytest.fixture(scope="module")
 def dagbag():
-    return DagBag(dag_folder="dags", include_examples=False)
+    # No include_examples: it was removed in Airflow 3. Examples are governed by
+    # core.load_examples, and pointing at our own folder excludes them anyway.
+    bag = DagBag(dag_folder=str(DAG_FOLDER))
+    assert not bag.import_errors, f"DAG import errors: {bag.import_errors}"
+    return bag
 
 
 def test_dags_import_without_errors(dagbag):
@@ -25,7 +42,7 @@ def test_dags_import_without_errors(dagbag):
 
 
 def test_sales_dag_is_registered(dagbag):
-    assert DAG_ID in dagbag.dags
+    assert DAG_ID in dagbag.dags, f"found instead: {list(dagbag.dags)}"
 
 
 def test_task_graph_matches_the_documented_flow(dagbag):
@@ -44,4 +61,6 @@ def test_dag_has_retries_and_no_catchup(dagbag):
 
     assert dag.catchup is False
     assert dag.max_active_runs == 1
-    assert dag.default_args["retries"] >= 1
+    # Asserted on a task rather than dag.default_args: default_args is an
+    # authoring-time convenience, and what matters is that it reached the tasks.
+    assert dag.get_task("process_file").retries >= 1
