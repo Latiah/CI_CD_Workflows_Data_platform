@@ -8,7 +8,9 @@ x-airflow-common: &airflow-common
   build:
     context: .
     dockerfile: docker/airflow/Dockerfile
-  image: ${IMAGE_REGISTRY:-mini-data-platform}/airflow:${IMAGE_TAG:-local}
+  # AIRFLOW_IMAGE lets a deploy point compose at an already-published
+  # artifact (`docker compose up --no-build`) instead of building locally.
+  image: ${AIRFLOW_IMAGE:-mini-data-platform/airflow}:${IMAGE_TAG:-local}
   env_file:
     - path: .env
       required: false
@@ -312,7 +314,7 @@ services:
     build:
       context: .
       dockerfile: docker/data_generator/Dockerfile
-    image: ${IMAGE_REGISTRY:-mini-data-platform}/data-generator:${IMAGE_TAG:-local}
+    image: ${GENERATOR_IMAGE:-mini-data-platform/data-generator}:${IMAGE_TAG:-local}
     container_name: mdp-data-generator
     profiles: ["generator"]
     environment:
@@ -379,7 +381,7 @@ services:
       ANALYTICS_DB: ${ANALYTICS_DB:-analytics}
     volumes:
       - ./scripts:/scripts:ro
-    command: ["python", "/scripts/setup_metabase.py"]
+    command: ["python", "/scripts/provision_metabase.py"]
     depends_on:
       metabase:
         condition: service_healthy

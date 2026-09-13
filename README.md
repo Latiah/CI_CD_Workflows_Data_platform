@@ -23,17 +23,20 @@ path still works on every commit.
 ## Quick start
 
 ```bash
-cp .env.example .env         # optional: every value has a working default
-docker compose up -d --build # start the platform
+cp .env.example .env         # every value has a working default
+./scripts/gen_secrets.sh     # replace the public placeholder secrets
 
-docker compose --profile setup run --rm metabase-init   # provision Metabase
-docker compose run --rm data-generator --rows 2000      # drop a batch into MinIO
+make up                      # build and start, waiting until all services are healthy
+make metabase                # create the admin user and connect the warehouse
+make seed                    # drop a batch of synthetic sales into MinIO
 ```
 
-Or, with `make`:
+Without `make`:
 
 ```bash
-make up && make metabase && make seed
+docker compose up -d --build --wait --wait-timeout 600   postgres minio airflow-apiserver airflow-scheduler airflow-dag-processor metabase
+python -m scripts.provision_metabase
+docker compose run --rm data-generator --rows 2000
 ```
 
 Airflow picks the file up within ten minutes on its own schedule; to see it
@@ -179,10 +182,10 @@ defines the warehouse:
 ## Part 3 — Visualization
 
 ```bash
-docker compose --profile setup run --rm metabase-init
+make metabase          # or: python -m scripts.provision_metabase
 ```
 
-[scripts/setup_metabase.py](scripts/setup_metabase.py) creates the admin account
+[scripts/provision_metabase.py](scripts/provision_metabase.py) creates the admin account
 and registers the `analytics` database over the Metabase API — idempotent, so
 re-running it just re-syncs the schema.
 
@@ -257,12 +260,18 @@ what to configure — so a fork never fails CI on missing infrastructure.
 ## Running tests locally
 
 ```bash
-pip install -r tests/requirements.txt
+pip install -r requirements-dev.txt
 
-pytest tests/unit -v          # fast, no Docker
-pytest tests/integration -v   # needs `docker compose up -d` first
-make smoke                    # up + provision + seed + validate, in one go
+make test     # unit tests - fast, no Docker
+make lint     # ruff + hadolint (containerised, same as CI)
+make validate # compose file and SQL bootstrap
+make e2e      # end-to-end, needs `make up` first
+make smoke    # up + provision + seed + validate, in one go
 ```
+
+CI runs these exact targets with `PY="python"`, so a green `make lint test`
+locally means the same commands ran in the pipeline. Pass `PY=` to pin an
+interpreter: `make test PY=python3.12`.
 
 ---
 
@@ -275,7 +284,8 @@ make smoke                    # up + provision + seed + validate, in one go
 ├── src/pipeline/              # Transform + warehouse logic (Airflow-free, testable)
 ├── config/postgres/init/      # Database and warehouse schema bootstrap
 ├── docker/                    # Dockerfiles for the custom images
-├── scripts/setup_metabase.py  # Metabase provisioning over the API
+├── scripts/                   # Metabase provisioning, secret generation
+├── requirements-dev.txt       # One toolchain for local and CI
 ├── tests/unit/                # Transform rules and DAG integrity
 ├── tests/integration/         # End-to-end data flow validation
 ├── .github/workflows/main.yml # CI/CD pipeline

@@ -1,13 +1,50 @@
 .DEFAULT_GOAL := help
 COMPOSE := docker compose
 
-.PHONY: help up down restart build logs ps seed seed-loop metabase test test-unit test-integration lint validate clean smoke
+# Overridable so CI can pin the interpreter it set up: `make test PY="python"`.
+PY ?= python
+
+# The services the end-to-end flow needs. The triggerer is excluded on purpose
+# (nothing defers) and the generator is on-demand.
+CORE_SERVICES := postgres minio airflow-apiserver airflow-scheduler airflow-dag-processor metabase
+
+.PHONY: help env up down restart build logs ps seed seed-loop metabase \
+        lint validate test e2e clean smoke
 
 help: ## Show this help
-	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}'
+	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}'
 
-up: ## Build images and start the whole platform
-	$(COMPOSE) up -d --build
+env: ## Create .env from the template and generate fresh secrets
+	@test -f .env || cp .env.example .env
+	./scripts/gen_secrets.sh
+
+# ---------------------------------------------------------------- checks
+lint: ## Ruff + hadolint (containerised, so CI and local agree)
+	$(PY) -m ruff check .
+	$(PY) -m ruff format --check .
+	@for f in docker/airflow/Dockerfile docker/data_generator/Dockerfile; do \
+		echo "hadolint $$f"; \
+		docker run --rm -i hadolint/hadolint:latest \
+			hadolint --failure-threshold error - < "$$f" || exit 1; \
+	done
+
+validate: ## Validate the compose file and the SQL bootstrap
+	$(COMPOSE) config --quiet
+	@$(COMPOSE) config --services
+	@for f in config/postgres/init/*.sql; do \
+		test -s "$$f" || { echo "Empty SQL file: $$f"; exit 1; }; \
+		echo "ok: $$f"; \
+	done
+
+test: ## Unit tests (fast, no Docker)
+	$(PY) -m pytest tests/unit -v
+
+e2e: ## End-to-end data flow validation against the running stack
+	$(PY) -m pytest tests/integration -v
+
+# ---------------------------------------------------------------- platform
+up: ## Build and start the platform, waiting until every service is healthy
+	$(COMPOSE) up -d --build --wait --wait-timeout 600 $(CORE_SERVICES)
 	@echo ""
 	@echo "  Airflow   http://localhost:8080  (airflow / airflow)"
 	@echo "  MinIO     http://localhost:9001  (minioadmin / minioadmin)"
@@ -27,10 +64,13 @@ build: ## Build the custom images only
 	$(COMPOSE) build
 
 ps: ## Show service status
-	$(COMPOSE) ps
+	$(COMPOSE) ps --all
 
 logs: ## Tail logs for all services
 	$(COMPOSE) logs -f --tail=100
+
+metabase: ## Create the Metabase admin user and connect the analytics database
+	$(PY) -m scripts.provision_metabase
 
 seed: ## Generate one batch of synthetic sales data into MinIO
 	$(COMPOSE) run --rm data-generator --rows 2000
@@ -38,26 +78,8 @@ seed: ## Generate one batch of synthetic sales data into MinIO
 seed-loop: ## Keep generating a batch every 5 minutes in the background
 	$(COMPOSE) --profile generator up -d data-generator
 
-metabase: ## Create the Metabase admin user and connect the analytics database
-	$(COMPOSE) --profile setup run --rm metabase-init
-
-lint: ## Lint Python and validate the compose file
-	ruff check .
-	ruff format --check .
-	$(COMPOSE) config --quiet
-
-validate: lint ## Alias for lint
-
-test-unit: ## Run fast unit tests (no Docker required)
-	pytest tests/unit -v
-
-test-integration: ## Run end-to-end data flow validation against the running stack
-	pytest tests/integration -v
-
-test: test-unit test-integration ## Run the full suite
-
-smoke: ## One command: start, seed, and validate the whole flow
+smoke: ## One command: start, provision, seed, and validate the whole flow
 	$(MAKE) up
 	$(MAKE) metabase
 	$(MAKE) seed
-	$(MAKE) test-integration
+	$(MAKE) e2e

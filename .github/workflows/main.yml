@@ -1,340 +1,292 @@
-name: Mini Data Platform CI/CD
+---
+name: ci
 
 on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
   workflow_dispatch:
 
+# A newer push makes an in-flight run irrelevant; don't queue integration jobs.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
-  REGISTRY: ghcr.io
-  IMAGE_NAMESPACE: ${{ github.repository }}
+  PYTHON_VERSION: "3.12"
 
 jobs:
-  # ==========================================================================
-  # CI 1 — static checks: Python lint, Dockerfile lint, compose validation
-  # ==========================================================================
+  # Fast tier: everything that needs no running services. Target under 90s.
   lint:
-    name: Lint (python, dockerfiles, compose)
+    name: lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
-
-      - name: Install lint tooling
-        run: pip install ruff==0.8.6
-
-      - name: Ruff check
-        run: ruff check . --output-format=github
-
-      - name: Ruff format check
-        run: ruff format --check .
-
-      # `dockerfile` must be the literal filename to match against, not a glob:
-      # with recursive:true the action does `find . -name "$dockerfile"`, so a
-      # value like "docker/**/Dockerfile" never matches anything (find -name
-      # only compares basenames) and the step was passing without linting
-      # either docker/airflow/Dockerfile or docker/data_generator/Dockerfile.
-      - name: Lint Dockerfiles (hadolint)
-        uses: hadolint/hadolint-action@v3.1.0
-        with:
-          recursive: true
-          dockerfile: Dockerfile
-          failure-threshold: error
-
-      - name: Validate docker-compose.yml
-        run: |
-          cp .env.example .env
-          docker compose config --quiet
-          echo "Services declared:"
-          docker compose config --services
-
-      - name: Check SQL init scripts are present and non-empty
-        run: |
-          for file in config/postgres/init/*.sql; do
-            test -s "$file" || { echo "Empty SQL file: $file"; exit 1; }
-            echo "ok: $file"
-          done
-
-  # ==========================================================================
-  # CI 2 — unit tests for the transformation rules and the DAG structure
-  # ==========================================================================
-  unit-tests:
-    name: Unit tests
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
+          python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
 
-      - name: Install test dependencies
-        run: pip install -r tests/requirements.txt
+      - name: Install toolchain
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
 
-      - name: Run unit tests
-        run: pytest tests/unit -v --junit-xml=unit-results.xml
+      - name: Generate .env
+        run: |
+          cp .env.example .env
+          ./scripts/gen_secrets.sh
 
-      - name: Upload test results
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: unit-test-results
-          path: unit-results.xml
+      # Exactly the target developers run. hadolint is not on the runner and
+      # the linters are containerised anyway, so parity costs only two small
+      # image pulls and removes any chance of CI and local drifting.
+      - name: make lint
+        run: make lint PY="python"
 
-  # ==========================================================================
-  # CI 3 — DAG integrity, exercised in the real Airflow image
-  #
-  # tests/unit/test_dag_integrity.py does `pytest.importorskip("airflow")` so
-  # it runs cleanly in the unit-tests job above even without Airflow
-  # installed - but that also means it always skips there, since the runner
-  # never has Airflow. This job builds the "test" stage of the Airflow image
-  # (same base, same providers, same DAG files) and runs that same test
-  # inside it, so DAG import/graph errors actually fail CI instead of being
-  # silently skipped.
-  # ==========================================================================
-  dag-integrity:
-    name: DAG integrity (in-container)
+      - name: make validate
+        run: make validate
+
+  unit:
+    name: unit tests
     runs-on: ubuntu-latest
-    needs: [lint]
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build Airflow test image
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install toolchain
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: make test
+        run: make test PY="python"
+
+  # tests/unit/test_dag_integrity.py calls pytest.importorskip("airflow"), so on
+  # a bare runner it always skips. Running it inside the image the scheduler
+  # actually uses turns it into a real check.
+  dags:
+    name: dag integrity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build test image
         run: docker build --target test -t airflow-test:ci -f docker/airflow/Dockerfile .
 
       - name: Parse DAG bag
         run: |
           docker run --rm --entrypoint python airflow-test:ci \
-            -m pytest /opt/airflow/tests/unit/test_dag_integrity.py -v
+            -m pytest /opt/airflow/tests/unit/test_dag_integrity.py -q
 
-  # ==========================================================================
-  # CI 4 — build the custom images and publish them to GHCR
-  # ==========================================================================
-  build-images:
-    name: Build ${{ matrix.service }} image
+  # Integration tier: the real stack, exercised end to end.
+  integration:
+    name: end-to-end
     runs-on: ubuntu-latest
-    needs: [lint, unit-tests, dag-integrity]
-    permissions:
-      contents: read
-      packages: write
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - service: airflow
-            dockerfile: docker/airflow/Dockerfile
-          - service: data-generator
-            dockerfile: docker/data_generator/Dockerfile
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GHCR
-        if: github.event_name == 'push'
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Docker metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.service }}
-          tags: |
-            type=ref,event=branch
-            type=sha,format=short
-            type=raw,value=latest,enable={{is_default_branch}}
-
-      - name: Build and push
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ${{ matrix.dockerfile }}
-          push: ${{ github.event_name == 'push' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=${{ matrix.service }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
-
-  # ==========================================================================
-  # CI 5 — data flow validation:
-  #        MinIO -> Airflow -> PostgreSQL -> Metabase, on a real stack
-  # ==========================================================================
-  data-flow-validation:
-    name: Data flow validation (end-to-end)
-    runs-on: ubuntu-latest
-    needs: [lint, unit-tests, dag-integrity]
-    timeout-minutes: 45
+    needs: [lint, unit, dags]
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
 
-      - name: Install test dependencies
-        run: pip install -r tests/requirements.txt
+      - name: Install toolchain
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
 
-      - name: Prepare environment
+      - name: Generate .env
         run: |
           cp .env.example .env
           echo "AIRFLOW_UID=$(id -u)" >> .env
+          ./scripts/gen_secrets.sh
 
+      # --wait blocks until every named service reports healthy, replacing a
+      # hand-rolled polling loop and failing fast when one never gets there.
       - name: Start the platform
-        run: docker compose up -d --build
-
-      - name: Wait for services to report healthy
         run: |
-          set -e
-          for service in postgres minio airflow-apiserver airflow-scheduler airflow-dag-processor metabase; do
-            echo "Waiting for $service..."
-            for attempt in $(seq 1 60); do
-              container=$(docker compose ps -q "$service")
-              status=$(docker inspect -f '{{.State.Health.Status}}' "$container" 2>/dev/null || echo starting)
-              if [ "$status" = "healthy" ]; then
-                echo "  $service is healthy"
-                break
-              fi
-              if [ "$attempt" = "60" ]; then
-                echo "  $service never became healthy (last status: $status)"
-                docker compose logs --tail=80 "$service"
-                exit 1
-              fi
-              sleep 5
-            done
-          done
+          docker compose up -d --build --wait --wait-timeout 600 \
+            postgres minio airflow-apiserver airflow-scheduler airflow-dag-processor metabase
 
-      - name: Provision Metabase (admin user + analytics connection)
-        run: docker compose --profile setup run --rm metabase-init
+      - name: Provision Metabase
+        run: python -m scripts.provision_metabase
 
-      - name: Verify the DAG parsed without errors
-        run: |
-          docker compose exec -T airflow-dag-processor airflow dags list
-          errors=$(docker compose exec -T airflow-dag-processor airflow dags list-import-errors --output json)
-          echo "$errors"
-          if [ "$(printf '%s' "$errors" | tr -d '[:space:]')" != "[]" ]; then
-            echo "::error::Airflow reported DAG import errors"
-            exit 1
-          fi
+      - name: make e2e
+        run: make e2e PY="python"
 
-      - name: Run end-to-end data flow tests
-        env:
-          MINIO_ENDPOINT: http://localhost:9000
-          AIRFLOW_URL: http://localhost:8080
-          METABASE_URL: http://localhost:3000
-          POSTGRES_HOST: localhost
-        run: pytest tests/integration -v --junit-xml=integration-results.xml
-
-      - name: Show pipeline summary
-        if: always()
-        run: |
-          docker compose exec -T postgres psql -U platform -d analytics -c \
-            "SELECT * FROM analytics.v_kpi_summary;" || true
-          docker compose exec -T postgres psql -U platform -d analytics -c \
-            "SELECT * FROM analytics.v_pipeline_health LIMIT 10;" || true
-
-      - name: Dump logs on failure
+      - name: Report failure in the run summary
         if: failure()
         run: |
-          # Under LocalExecutor the scheduler runs the tasks, so a task
-          # traceback lands there - give it the most room.
-          echo "::group::airflow-scheduler"
-          docker compose logs --tail=400 airflow-scheduler || true
-          echo "::endgroup::"
-          for service in airflow-dag-processor airflow-apiserver minio postgres metabase; do
-            echo "::group::$service"
-            docker compose logs --tail=80 "$service" || true
-            echo "::endgroup::"
-          done
-          # Task logs are written to files, not stdout, so surface them directly.
-          echo "::group::task logs on disk"
-          docker compose exec -T airflow-scheduler \
-            bash -c 'find /opt/airflow/logs -name "*.log" -newermt "-30 minutes" -print -exec tail -n 60 {} \;' || true
-          echo "::endgroup::"
-          # Did any container get OOM-killed? That is invisible in the app logs.
-          echo "::group::container exit states"
-          docker compose ps -a
-          for c in $(docker compose ps -aq); do
-            docker inspect -f '{{.Name}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} status={{.State.Status}}' "$c" || true
-          done
-          echo "::endgroup::"
+          {
+            echo "## End-to-end failed"
+            echo
+            echo "| service | state |"
+            echo "| :-- | :-- |"
+            docker compose ps --all --format '| {{.Service}} | {{.Status}} |' || true
+            echo
+            echo "Service logs are attached as the \`compose-logs\` artifact."
+          } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload test results
-        if: always()
+      - name: Collect logs
+        if: failure()
+        run: |
+          mkdir -p out/logs
+          docker compose logs --no-color > out/logs/compose.log 2>&1 || true
+          docker compose ps --all > out/logs/ps.txt 2>&1 || true
+          # A container killed for memory shows nothing in its application log,
+          # so record the exit state explicitly.
+          for c in $(docker compose ps -aq); do
+            docker inspect -f '{{.Name}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} status={{.State.Status}}' \
+              "$c" >> out/logs/ps.txt 2>&1 || true
+          done
+          # Task logs are written to files inside the scheduler, not to stdout.
+          docker compose exec -T airflow-scheduler \
+            bash -c 'find /opt/airflow/logs -name "*.log" -newermt "-30 minutes" \
+              -print -exec tail -n 80 {} \;' > out/logs/tasks.log 2>&1 || true
+
+      - name: Upload logs
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: integration-test-results
-          path: integration-results.xml
+          name: compose-logs-${{ github.run_id }}
+          path: out/logs/
+          retention-days: 7
 
       - name: Tear down
         if: always()
         run: docker compose down -v
 
-  # ==========================================================================
-  # CD — deploy the validated stack to the test environment
-  # ==========================================================================
-  deploy-test:
-    name: Deploy to test environment
+  # Deployment step 1: publish the immutable artifact.
+  publish:
+    name: publish image
     runs-on: ubuntu-latest
-    needs: [build-images, data-flow-validation]
+    needs: [integration]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-    environment:
-      name: test
-      url: ${{ vars.TEST_ENV_URL }}
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Resolve image tag
-        id: tag
-        run: echo "value=sha-$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+      # The runner's default buildx driver is plain "docker", which cannot
+      # export a cache; type=gha needs the container driver this sets up.
+      - uses: docker/setup-buildx-action@v3
 
-      - name: Deploy over SSH
-        if: vars.DEPLOY_HOST != ''
-        uses: appleboy/ssh-action@v1.2.0
+      - uses: docker/login-action@v3
         with:
-          host: ${{ vars.DEPLOY_HOST }}
-          username: ${{ vars.DEPLOY_USER }}
-          key: ${{ secrets.DEPLOY_SSH_KEY }}
-          script: |
-            set -e
-            cd ${{ vars.DEPLOY_PATH }}
-            git fetch --all && git reset --hard origin/main
-            export IMAGE_REGISTRY=${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}
-            export IMAGE_TAG=${{ steps.tag.outputs.value }}
-            echo "${{ secrets.GITHUB_TOKEN }}" | docker login ${{ env.REGISTRY }} -u ${{ github.actor }} --password-stdin
-            docker compose pull
-            docker compose up -d --remove-orphans
-            docker compose ps
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Post-deploy smoke check
-        if: vars.TEST_ENV_URL != ''
+      - name: Compute image reference
+        id: meta
         run: |
-          set -e
-          for path in ":8080/health" ":3000/api/health"; do
-            url="${{ vars.TEST_ENV_URL }}${path}"
-            echo "Checking $url"
-            curl --fail --silent --show-error --retry 10 --retry-delay 10 --retry-all-errors "$url" > /dev/null
-          done
-          echo "Test environment is serving Airflow and Metabase."
+          repo=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          echo "image=ghcr.io/${repo}/airflow:sha-${{ github.sha }}" >> "$GITHUB_OUTPUT"
 
-      - name: Deployment not configured
-        if: vars.DEPLOY_HOST == ''
+      # Tagged by commit sha, never latest: a mutable tag is how CI goes green
+      # while the environment keeps running older code.
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/airflow/Dockerfile
+          target: runtime
+          push: true
+          tags: ${{ steps.meta.outputs.image }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # Deployment step 2: deploy that exact published image into a designated
+  # test environment and prove data still flows through it. Nothing is rebuilt
+  # here — this exercises the artifact that would ship.
+  deploy-test:
+    name: deploy to test environment
+    runs-on: ubuntu-latest
+    needs: [publish]
+    environment:
+      name: test
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install toolchain
         run: |
-          echo "::notice::No DEPLOY_HOST variable set - skipping remote deployment."
-          echo "Images published as ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/*:${{ steps.tag.outputs.value }}"
-          echo "Set repository variables DEPLOY_HOST, DEPLOY_USER, DEPLOY_PATH, TEST_ENV_URL"
-          echo "and the DEPLOY_SSH_KEY secret to enable continuous deployment."
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate .env
+        run: |
+          cp .env.example .env
+          echo "AIRFLOW_UID=$(id -u)" >> .env
+          ./scripts/gen_secrets.sh
+
+      - name: Deploy the published image
+        env:
+          PUBLISHED_IMAGE: ${{ needs.publish.outputs.image }}
+        run: |
+          docker pull "$PUBLISHED_IMAGE"
+          # Point compose at the published artifact instead of a local build.
+          AIRFLOW_IMAGE="${PUBLISHED_IMAGE%:*}" IMAGE_TAG="${PUBLISHED_IMAGE##*:}" \
+            docker compose up -d --no-build --wait --wait-timeout 600 \
+              postgres minio airflow-apiserver airflow-scheduler airflow-dag-processor metabase
+
+      - name: Provision Metabase
+        run: python -m scripts.provision_metabase
+
+      - name: Smoke-test the deployed artifact
+        run: python -m pytest tests/integration -q
+
+      - name: Record what was deployed
+        if: always()
+        env:
+          PUBLISHED_IMAGE: ${{ needs.publish.outputs.image }}
+          OUTCOME: ${{ job.status }}
+        run: |
+          {
+            echo "## Test environment deploy: $OUTCOME"
+            echo
+            echo "Image: \`$PUBLISHED_IMAGE\`"
+            echo
+            echo "Deployed with --no-build, so the artifact tested is the one published."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Collect logs
+        if: failure()
+        run: |
+          mkdir -p out/logs
+          docker compose logs --no-color > out/logs/compose.log 2>&1 || true
+
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deploy-logs-${{ github.run_id }}
+          path: out/logs/
+          retention-days: 7
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v

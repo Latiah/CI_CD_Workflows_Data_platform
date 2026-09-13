@@ -4,7 +4,7 @@ Idempotent — if Metabase is already set up, it logs in instead and only adds t
 database connection when it is missing. Standard library only, so it runs in a
 bare python image or on the host.
 
-    python scripts/setup_metabase.py
+    python -m scripts.provision_metabase
 """
 
 from __future__ import annotations
@@ -21,8 +21,12 @@ ADMIN_EMAIL = os.environ.get("METABASE_ADMIN_EMAIL", "admin@example.com")
 ADMIN_PASSWORD = os.environ.get("METABASE_ADMIN_PASSWORD", "Metabase123!")
 DB_DISPLAY_NAME = os.environ.get("METABASE_DB_NAME", "Mini Data Platform")
 
+# These details are not used to connect from here — they are handed to Metabase,
+# which resolves them from inside its own container. So the default is the
+# compose service name, not localhost, whether this script runs on the host or
+# in the network.
 PG = {
-    "host": os.environ.get("POSTGRES_HOST", "localhost"),
+    "host": os.environ.get("POSTGRES_HOST", "postgres"),
     "port": int(os.environ.get("POSTGRES_PORT", "5432")),
     "dbname": os.environ.get("ANALYTICS_DB", "analytics"),
     "user": os.environ.get("POSTGRES_USER", "platform"),

@@ -1,0 +1,12 @@
+# Development and CI toolchain. One file so `make` targets and the workflow
+# install exactly the same thing — CI and local cannot drift.
+
+# Test runner and the libraries the suites import directly
+pytest==8.3.4
+pandas==2.2.3
+boto3==1.35.92
+psycopg2-binary==2.9.10
+Faker==33.3.1
+
+# Linting and formatting
+ruff==0.8.6
