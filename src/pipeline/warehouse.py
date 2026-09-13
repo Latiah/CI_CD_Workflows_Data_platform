@@ -1,11 +1,18 @@
-"""Warehouse writes. Takes an open psycopg2 connection so the caller (the DAG,
-a test, a script) decides where the connection comes from."""
+"""Warehouse writes. Takes an open DB-API connection so the caller (the DAG, a
+test, a script) decides where the connection comes from.
+
+Deliberately driver-agnostic: apache-airflow-providers-postgres 6.x moved from
+psycopg2 to psycopg 3, so PostgresHook.get_conn() returns a psycopg3 connection
+while a test or script may hand in a psycopg2 one. Everything here sticks to
+plain DB-API - execute, executemany, rowcount - rather than a driver's own
+helpers. Using psycopg2.extras.execute_values on a psycopg3 connection fails
+with "'Connection' object has no attribute 'encoding'".
+"""
 
 from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-from psycopg2.extras import execute_values
 
 SALES_COLUMNS = [
     "order_id",
@@ -26,16 +33,20 @@ SALES_COLUMNS = [
     "source_file",
 ]
 
+_SALES_PLACEHOLDERS = ", ".join(["%s"] * len(SALES_COLUMNS))
+
 INSERT_SALES = f"""
 INSERT INTO analytics.sales ({", ".join(SALES_COLUMNS)})
-VALUES %s
+VALUES ({_SALES_PLACEHOLDERS})
 ON CONFLICT (order_id) DO NOTHING
-RETURNING 1
 """
 
+# raw_record is jsonb. psycopg3 binds parameters server-side with an explicit
+# type, so a Python str arrives as text and Postgres will not implicitly cast
+# it; the ::jsonb makes the conversion explicit and works on both drivers.
 INSERT_REJECTS = """
 INSERT INTO analytics.sales_rejects (source_file, reason, raw_record)
-VALUES %s
+VALUES (%s, %s, %s::jsonb)
 """
 
 UPSERT_INGESTION = """
@@ -50,9 +61,11 @@ ON CONFLICT (object_key) DO UPDATE SET
     ingested_at   = now()
 """
 
+COUNT_BY_SOURCE = "SELECT COUNT(*) FROM analytics.sales WHERE source_file = %s"
+
 
 def _to_python(value):
-    """psycopg2 cannot adapt numpy scalars or pandas NA — convert to natives."""
+    """Neither psycopg2 nor psycopg3 can adapt numpy scalars or pandas NA."""
     if value is None:
         return None
     if isinstance(value, np.generic):
@@ -73,18 +86,32 @@ def processed_keys(conn, bucket: str) -> set[str]:
 
 
 def insert_sales(conn, frame: pd.DataFrame) -> int:
-    """Insert clean rows, skipping any order_id already in the warehouse."""
+    """Insert clean rows, skipping any order_id already in the warehouse.
+
+    Returns the number of rows actually inserted. rowcount after executemany is
+    the total affected across the batch on both drivers, but it is advisory in
+    DB-API, so fall back to counting the file's rows.
+    """
     if frame.empty:
         return 0
+
     records = [
         tuple(_to_python(value) for value in row)
         for row in frame[SALES_COLUMNS].itertuples(index=False, name=None)
     ]
+    source_file = records[0][SALES_COLUMNS.index("source_file")]
+
     with conn.cursor() as cursor:
-        # fetch=True aggregates RETURNING across every page, so the count stays
-        # accurate for files larger than one page.
-        inserted = execute_values(cursor, INSERT_SALES, records, page_size=1000, fetch=True)
-        return len(inserted)
+        cursor.execute(COUNT_BY_SOURCE, (source_file,))
+        before = cursor.fetchone()[0]
+
+        cursor.executemany(INSERT_SALES, records)
+        inserted = cursor.rowcount
+
+        if inserted is None or inserted < 0:
+            cursor.execute(COUNT_BY_SOURCE, (source_file,))
+            inserted = cursor.fetchone()[0] - before
+    return int(inserted)
 
 
 def insert_rejects(conn, rejects: list[dict]) -> int:
@@ -92,8 +119,8 @@ def insert_rejects(conn, rejects: list[dict]) -> int:
         return 0
     records = [(r["source_file"], r["reason"], r["raw_record"]) for r in rejects]
     with conn.cursor() as cursor:
-        execute_values(cursor, INSERT_REJECTS, records, page_size=1000)
-        return len(records)
+        cursor.executemany(INSERT_REJECTS, records)
+    return len(records)
 
 
 def record_ingestion(

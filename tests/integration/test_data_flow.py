@@ -103,11 +103,13 @@ def task_log(run_id: str, task: dict, tail: int = 60) -> str:
     """
     task_id, try_number = task["task_id"], max(task.get("try_number") or 1, 1)
     map_index = task.get("map_index", -1)
-    base = f"/api/v2/dags/{DAG_ID}/dagRuns/{run_id}/taskInstances/{task_id}"
-    path = f"{base}/{map_index}/logs/{try_number}" if map_index >= 0 else f"{base}/logs/{try_number}"
+    # There is no map_index path segment: a mapped instance is selected with a
+    # query parameter. Using a path segment returns 404.
+    path = f"/api/v2/dags/{DAG_ID}/dagRuns/{run_id}/taskInstances/{task_id}/logs/{try_number}"
+    query = f"?full_content=true&map_index={map_index}"
 
     try:
-        payload = airflow_request("GET", f"{path}?full_content=true")
+        payload = airflow_request("GET", f"{path}{query}")
     except Exception as exc:  # noqa: BLE001 - diagnostics only
         return f"<could not fetch log for {task_id}[{map_index}]: {exc}>"
 
