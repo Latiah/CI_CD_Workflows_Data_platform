@@ -33,294 +33,192 @@ make metabase                # create the admin user and connect the warehouse
 make seed                    # drop a batch of synthetic sales into MinIO
 ```
 
-Without `make`:
-
-```bash
-docker compose up -d --build --wait --wait-timeout 600   postgres minio airflow-apiserver airflow-scheduler airflow-dag-processor metabase
-python -m scripts.provision_metabase
-docker compose run --rm data-generator --rows 2000
-```
-
-Airflow picks the file up within ten minutes on its own schedule; to see it
-immediately, open http://localhost:8080 and trigger the **`sales_ingestion`**
-DAG, or run:
-
-```bash
-docker compose exec airflow-dag-processor airflow dags trigger sales_ingestion
-```
-
-Then check the warehouse:
+Airflow picks the file up within ten minutes on its own schedule. To see it
+immediately, trigger the **`sales_ingestion`** DAG at http://localhost:8080, then:
 
 ```bash
 docker compose exec postgres psql -U platform -d analytics -c "SELECT * FROM analytics.v_kpi_summary;"
 ```
 
-**Default credentials** (change them for anything but local use):
-
-| Service | User | Password |
-| :-- | :-- | :-- |
-| Airflow | `airflow` | `airflow` |
-| MinIO Console | `minioadmin` | `minioadmin` |
-| Metabase | `admin@example.com` | `Metabase123!` |
-| PostgreSQL | `platform` | `platform` |
+**Default credentials** — change them for anything but local use:
+Airflow `airflow`/`airflow` · MinIO `minioadmin`/`minioadmin` ·
+Metabase `admin@example.com`/`Metabase123!` · PostgreSQL `platform`/`platform`
 
 ---
 
-## Part 1 — Infrastructure
+## Commands
 
-All four services, plus two one-shot helpers, live in
-[docker-compose.yml](docker-compose.yml) on a single `data-platform` bridge
-network, so Airflow reaches MinIO at `http://minio:9000` and PostgreSQL at
-`postgres:5432` by service name — no host ports involved.
+Every target works locally and is what CI runs, so the two cannot drift.
 
-**Persistence** — five named volumes survive `docker compose down`:
-`postgres-data`, `minio-data`, `metabase-data`, `airflow-logs`,
-`airflow-plugins`. Use `make clean` (`docker compose down -v`) to wipe them.
-
-**One Postgres, three databases** — created by
-[config/postgres/init/01-create-databases.sql](config/postgres/init/01-create-databases.sql):
-`airflow` (Airflow metadata), `analytics` (the warehouse), and `metabase`
-(Metabase's own application state, so it never falls back to ephemeral H2).
-
-**Connections without clicking** — Airflow's MinIO and Postgres connections are
-injected as `AIRFLOW_CONN_*` environment variables, so a fresh stack is ready to
-run with no manual setup in the UI.
-
-**Airflow 3 topology** — five components, not two. `airflow-init` migrates the
-metadata database and creates the admin user through the image entrypoint;
-`airflow-apiserver` serves the UI, the REST API and the Task Execution API;
-`airflow-dag-processor` parses `dags/` into serialised DAGs (its own service in
-Airflow 3 — without it the DAG never appears); `airflow-scheduler` decides what
-runs and, under LocalExecutor, runs it.
-
-`airflow-triggerer` is defined but not started by default. Nothing here defers,
-and an idle Airflow component costs memory the rest of the stack needs. Add a
-deferrable operator and you need it:
-`docker compose --profile deferrable up -d airflow-triggerer`.
-
-**Startup ordering** — `depends_on` conditions plus health checks mean
-`airflow-scheduler` only starts after Postgres is accepting connections, the
-MinIO buckets exist, `airflow-init` has migrated the metadata database, and the
-api-server is healthy. That last one matters: in Airflow 3 task code reaches
-Airflow through the Task Execution API rather than the metadata database, so a
-task cannot start without it — even under LocalExecutor.
-
----
-
-## Part 2 — The data engineering pipeline
-
-### Ingestion
-
-[data_generator/generate.py](data_generator/generate.py) produces synthetic
-sales orders — regions, product catalogue, channel mix, weekend demand lift —
-and uploads a CSV straight to `s3://raw-data/sales/`.
-
-About 4% of rows are **deliberately defective** (blank regions, negative
-quantities, unparseable prices, out-of-range discounts, stray whitespace), so
-the cleaning stage has something real to do and the tests can assert on it.
+| Command | What it does |
+| :-- | :-- |
+| `make up` / `make down` / `make clean` | Start (waits for healthy) / stop / stop and wipe volumes |
+| `make test` | Unit tests — fast, no Docker |
+| `make lint` | Ruff + hadolint (containerised) |
+| `make validate` | Compose file and SQL bootstrap |
+| `make e2e` | End-to-end data flow, needs `make up` first |
+| `make smoke` | up + provision + seed + validate, in one go |
+| `make seed` / `make metabase` | Generate a data batch / provision Metabase |
 
 ```bash
-docker compose run --rm data-generator --rows 5000        # one batch
-docker compose --profile generator up -d data-generator   # a batch every 5 min
-python -m data_generator.generate --rows 20 --out - --seed 1   # preview locally
+pip install -r requirements-dev.txt   # one toolchain for local and CI
 ```
 
-### Orchestration
+---
 
-[dags/sales_ingestion_dag.py](dags/sales_ingestion_dag.py) — DAG
-`sales_ingestion`, scheduled every 10 minutes:
+## How it works
 
-1. **`list_new_files`** — lists `sales/*.csv` in MinIO and subtracts everything
-   already recorded in `ops.ingested_files`. Returns an empty list on a quiet
-   cycle rather than skipping, which keeps the mapped task's XCom resolvable so
-   the summary still runs.
-2. **`process_file`** — dynamically mapped over each new object (4 at a time):
-   download → clean → load → archive.
-3. **`summarise`** — totals the run, runs `ANALYZE` so Metabase queries hit
-   fresh statistics, and logs a warehouse snapshot.
+**Infrastructure** — all services live in
+[docker-compose.yml](docker-compose.yml) on one bridge network, so Airflow
+reaches MinIO and PostgreSQL by service name. Five named volumes persist across
+`docker compose down`. One Postgres instance hosts three logical databases:
+`airflow` (metadata), `analytics` (the warehouse) and `metabase` (BI app state).
+Airflow's connections are injected as `AIRFLOW_CONN_*` environment variables, so
+a fresh stack needs no manual setup in the UI.
 
-An `S3KeySensor` sat in front of this and was removed. It cannot tell a new
-object from one already ingested, and with `soft_fail=True` a real failure —
-wrong endpoint, bad credentials — is recorded as a *skip*, which cascades
-downstream and leaves the DAG run green having loaded nothing. Listing the
-bucket answers the same question and fails loudly when MinIO is unreachable.
+**Ingestion** — [data_generator/](data_generator/) produces synthetic sales
+orders and uploads a CSV to `s3://raw-data/sales/`. About 4% of rows are
+**deliberately defective**, so the cleaning stage has real work to do and the
+tests have something to assert on.
 
-The cleaning rules live in
-[src/pipeline/transform.py](src/pipeline/transform.py), deliberately free of
-Airflow imports so they unit test in milliseconds:
+**Orchestration** — [dags/sales_ingestion_dag.py](dags/sales_ingestion_dag.py),
+scheduled every 10 minutes:
+
+1. **`list_new_files`** — lists the bucket, subtracts what `ops.ingested_files`
+   already records
+2. **`process_file`** — mapped over each new object (4 at a time): download →
+   clean → load → archive
+3. **`summarise`** — totals the run and refreshes statistics for Metabase
+
+**Cleaning rules**, in [src/pipeline/transform.py](src/pipeline/transform.py) —
+deliberately free of Airflow imports so they unit test in milliseconds:
 
 | Rule | Behaviour |
 | :-- | :-- |
-| Whitespace / casing | Trimmed; regions and categories title-cased, channels mapped to a canonical set (`website`, `online` → `web`) |
-| Required fields | Rows missing `order_id`, `customer_id`, `region`, `category`, `product` or `channel` are rejected |
+| Whitespace / casing | Trimmed; regions title-cased, channels mapped to a canonical set |
+| Required fields | Rows missing `order_id`, `region`, `product` etc. are rejected |
 | Timestamps | Parsed to UTC; unparseable values rejected |
 | Numerics | `quantity > 0`, `unit_price >= 0`, `0 <= discount_pct < 1` |
 | Duplicates | First occurrence of an `order_id` wins within a batch |
-| Derived columns | `order_date`, `gross_amount = quantity × unit_price`, `net_amount = gross × (1 − discount)` |
+| Derived | `order_date`, `gross_amount`, `net_amount` |
 
 Rejected rows are **not dropped** — they go to `analytics.sales_rejects` with a
-reason and the original record as JSON, so data quality is itself reportable.
+reason and the original record, so data quality is itself reportable.
 
-**Idempotency** is enforced at three levels: `ops.ingested_files` stops a file
-being picked up twice, `ON CONFLICT (order_id) DO NOTHING` stops duplicate
-orders, and processed objects are moved to the `raw-data-archive` bucket. Re-run
-the DAG as often as you like — row counts do not move. Test 10 in the
-integration suite asserts exactly this.
+**Idempotency** is enforced three ways: `ops.ingested_files` stops a file being
+consumed twice, `ON CONFLICT DO NOTHING` stops duplicate orders, and processed
+objects move to an archive bucket. Re-run the DAG as often as you like — row
+counts do not move.
 
-### Storage
+<details>
+<summary><b>Warehouse schema</b></summary>
 
-[config/postgres/init/02-analytics-schema.sql](config/postgres/init/02-analytics-schema.sql)
-defines the warehouse:
+[config/postgres/init/](config/postgres/init/) defines:
 
 - `analytics.sales` — the fact table, keyed on `order_id`, with check
   constraints mirroring the transform rules and indexes on date, region,
-  category and source file.
-- `analytics.sales_rejects` — quarantined rows with their rejection reason.
-- `ops.ingested_files` — pipeline bookkeeping: which object, how many rows in,
-  loaded, rejected, and under which DAG run.
+  category and source file
+- `analytics.sales_rejects` — quarantined rows with their rejection reason
+- `ops.ingested_files` — which object, how many rows in, loaded, rejected, and
+  under which DAG run
+
+</details>
 
 ---
 
-## Part 3 — Visualization
+## Dashboards
 
-```bash
-make metabase          # or: python -m scripts.provision_metabase
-```
-
-[scripts/provision_metabase.py](scripts/provision_metabase.py) creates the admin account
-and registers the `analytics` database over the Metabase API — idempotent, so
-re-running it just re-syncs the schema.
-
+`make metabase` creates the admin account and registers the `analytics`
+database over the API — idempotent, so re-running just re-syncs the schema.
 Six views are ready to chart at http://localhost:3000:
 
 | View | Suggested visualization |
 | :-- | :-- |
-| `v_kpi_summary` | Number cards — revenue, orders, customers, average order value |
+| `v_kpi_summary` | Number cards — revenue, orders, customers, AOV |
 | `v_daily_sales` | Line chart of revenue over time |
 | `v_sales_by_region` | Bar or map chart with revenue share |
 | `v_top_products` | Row chart, top 10 by revenue |
 | `v_channel_performance` | Stacked area chart by channel |
 | `v_pipeline_health` | Table — files ingested and their accept rate |
 
-To build the dashboard: **+ New → Question → Mini Data Platform → analytics →**
-pick a view, then **Save → Add to a dashboard**. Number cards from
-`v_kpi_summary` across the top, `v_daily_sales` as a full-width trend beneath,
-then region and product breakdowns side by side.
+**+ New → Question → Mini Data Platform → analytics →** pick a view, then
+**Save → Add to a dashboard**.
 
 ---
 
 ## CI/CD
 
-[.github/workflows/main.yml](.github/workflows/main.yml) runs six jobs in two
-tiers, then deploys.
+[.github/workflows/main.yml](.github/workflows/main.yml) runs six jobs:
 
-**Fast tier** — no running services, so it fails in under two minutes:
+| Tier | Job | What it does |
+| :-- | :-- | :-- |
+| Fast | **lint** | `make lint` + `make validate` |
+| Fast | **unit** | `make test` — no Docker needed |
+| Fast | **dags** | Parses the DAG bag inside the real Airflow image |
+| Integration | **integration** | Stands the stack up and asserts data moves `MinIO → Airflow → PostgreSQL → Metabase` |
+| Deploy | **publish** | Pushes the `runtime` image to GHCR tagged `sha-<commit>` |
+| Deploy | **deploy-test** | Pulls that exact tag, deploys `--no-build`, re-runs the suite |
 
-| Job | What it does |
-| :-- | :-- |
-| **lint** | `make lint` (ruff check + format, hadolint on both Dockerfiles) and `make validate` (compose config, SQL bootstrap) |
-| **unit** | `make test` — transform rules, no Docker needed |
-| **dags** | Builds the image's `test` stage and parses the DAG bag inside it |
+Three design points:
 
-**Integration tier** — the real stack, end to end:
+- **CI runs the same `make` targets you do**, so a green `make lint test`
+  locally means the pipeline ran identical commands.
+- **`--wait` replaces a polling loop** — it fails fast if a service never
+  becomes healthy, instead of letting tests queue against a dead scheduler.
+- **The deploy tests the artifact, not the source.** Tagging by commit sha and
+  deploying `--no-build` is what stops a pipeline going green while the
+  environment runs older code.
 
-| Job | What it does |
-| :-- | :-- |
-| **integration** | `compose up --wait` on the six core services, provisions Metabase, then `make e2e` asserts data moves `MinIO → Airflow → PostgreSQL → Metabase` |
+<details>
+<summary><b>What the end-to-end suite asserts</b></summary>
 
-**Deployment** — only on a push to `main`:
+[tests/integration/test_data_flow.py](tests/integration/test_data_flow.py)
+uploads a seeded 750-row batch, triggers the DAG over the REST API (Airflow 3
+drops Basic auth, so it exchanges credentials for a JWT at `/auth/token`), then
+asserts:
 
-| Job | What it does |
-| :-- | :-- |
-| **publish** | Builds the `runtime` stage and pushes it to GHCR tagged `sha-<commit>`, with GHA layer caching |
-| **deploy-test** | Pulls that exact tag, deploys it with `--no-build`, and re-runs the integration suite against it |
+- `analytics.sales` holds **exactly** the row count the transform predicted —
+  computed independently, not read back from the database
+- `ops.ingested_files` recorded the run, and `loaded + rejected == raw`
+- Defective rows landed in `sales_rejects` rather than vanishing
+- `gross_amount` / `net_amount` arithmetic holds across the table
+- All six KPI views return rows
+- The processed object was archived out of the landing zone
+- The Metabase API is healthy with the warehouse registered
+- A re-run inserts nothing new (idempotency)
 
-Three details worth knowing:
+</details>
 
-**CI runs the same `make` targets you do.** Every job invokes `make <target>
-PY="python"` rather than raw commands, so a green `make lint test` locally means
-the pipeline ran identical commands. There is no second copy of the build recipe
-to drift out of sync.
+<details>
+<summary><b>Deployment setup and failure diagnostics</b></summary>
 
-**`--wait` replaces a polling loop.** `compose up --wait --wait-timeout 600`
-blocks until every named service reports healthy and fails fast if one never
-gets there, instead of letting tests queue against a dead scheduler.
+`publish` needs no configuration — it uses the built-in `GITHUB_TOKEN`.
+`deploy-test` needs a **`test` environment** under Settings → Environments; it
+can be empty, but the job fails immediately if it does not exist. Adding
+required reviewers there turns the deploy into a gated release.
 
-**The deploy tests the artifact, not the source.** `publish` tags by commit sha,
-never `latest`, and `deploy-test` runs `--no-build` against that pulled image —
-so what gets smoke-tested is byte-for-byte what would ship. A mutable tag is how
-a pipeline goes green while the environment quietly runs older code.
+On failure, the `integration` job writes a service-state table to the run
+summary and uploads a `compose-logs-<run_id>` artifact containing `compose.log`,
+`ps.txt` (with per-container `oom=true/false`, since a container killed for
+memory leaves nothing in its own log) and `tasks.log`. The suite also pulls a
+failed task's Airflow log into the pytest output, so the common case needs no
+artifact download.
 
-The `dags` job exists because
-[tests/unit/test_dag_integrity.py](tests/unit/test_dag_integrity.py) calls
-`pytest.importorskip("airflow")`: on a bare runner it would always skip, so it
-runs inside the image the scheduler actually uses and becomes a real check.
-
-### Data flow validation
-
-[tests/integration/test_data_flow.py](tests/integration/test_data_flow.py) walks
-the full path against a live stack:
-
-1. Upload a seeded 750-row batch to MinIO and confirm the object exists.
-2. Trigger `sales_ingestion` over the Airflow REST API and wait for success
-   (reporting which tasks failed if it does not). Airflow 3 drops Basic auth,
-   so the suite exchanges the admin credentials for a JWT at `/auth/token`
-   and calls `/api/v2` with a bearer token.
-3. Assert `analytics.sales` holds **exactly** the number of rows the transform
-   predicted for that file — computed independently, not read back from the DB.
-4. Assert `ops.ingested_files` recorded the run and that
-   `loaded + rejected == raw`.
-5. Assert defective rows landed in `sales_rejects` rather than vanishing.
-6. Assert `gross_amount` and `net_amount` arithmetic holds across the table.
-7. Assert all six KPI views return rows.
-8. Assert the processed object was archived out of the landing zone.
-9. Assert the Metabase API is healthy and running on its Postgres app database.
-10. Re-run the DAG and assert row counts are unchanged (idempotency).
-
-### Deployment configuration
-
-Publishing uses the built-in `GITHUB_TOKEN`, so nothing needs configuring for
-`publish` to work. `deploy-test` needs one thing:
-
-- A **`test` environment** under Settings → Environments. It can be empty; the
-  job references `environment: name: test` and fails immediately if it does not
-  exist. Adding required reviewers there turns the deploy into a gated release.
-
-Images land at `ghcr.io/<owner>/<repo>/airflow:sha-<commit>`. Make the package
-public, or grant the repository read access, if anything outside Actions needs
-to pull it.
-
-### When a run fails
-
-The `integration` job writes a summary table of service states to the run page
-and uploads a `compose-logs-<run_id>` artifact containing:
-
-- `compose.log` — every service's output
-- `ps.txt` — container states, including `oom=true/false` per container, since a
-  container killed for memory leaves nothing in its own log
-- `tasks.log` — the Airflow task logs from disk, which is where a task traceback
-  actually lands
-
-The suite also pulls a failed task's log into the pytest failure message itself,
-so the common case needs no artifact download at all.
+</details>
 
 ---
 
-## Running tests locally
+## Troubleshooting
 
-```bash
-pip install -r requirements-dev.txt
-
-make test     # unit tests - fast, no Docker
-make lint     # ruff + hadolint (containerised, same as CI)
-make validate # compose file and SQL bootstrap
-make e2e      # end-to-end, needs `make up` first
-make smoke    # up + provision + seed + validate, in one go
-```
-
-CI runs these exact targets with `PY="python"`, so a green `make lint test`
-locally means the same commands ran in the pipeline. Pass `PY=` to pin an
-interpreter: `make test PY=python3.12`.
+| Symptom | Cause and fix |
+| :-- | :-- |
+| `mdp-airflow-apiserver is unhealthy` | Memory. The stack needs ~4 GB of Docker. On Windows, WSL takes half the host by default — create `%USERPROFILE%\.wslconfig` with `[wsl2]` / `memory=5GB`, then `wsl --shutdown` and restart Docker Desktop |
+| DAG never appears in the UI | Check the dag-processor, not the scheduler: `docker compose exec airflow-dag-processor airflow dags list-import-errors`. A DAG with an import error is simply absent |
+| DAG run does nothing | Correct when MinIO holds no new files. Run `make seed` first |
+| Port already in use | Override `POSTGRES_PORT`, `AIRFLOW_PORT`, `METABASE_PORT`, `MINIO_API_PORT` in `.env`, and point the tests at the same ports |
+| Airflow logs unwritable (Linux) | Set `AIRFLOW_UID=$(id -u)` in `.env`. Not needed on Docker Desktop |
+| MinIO images pull from `quay.io` | Deliberate — Docker Desktop's default image-access policy blocks the `minio/*` Docker Hub repositories |
+| Start completely fresh | `make clean` removes every volume, including the warehouse |
 
 ---
 
@@ -328,16 +226,11 @@ interpreter: `make test PY=python3.12`.
 
 ```text
 ├── dags/                        # Airflow DAG definitions
-│   └── sales_ingestion_dag.py
 ├── data_generator/              # Synthetic sales data generator
 ├── src/pipeline/                # Transform + warehouse logic (Airflow-free, testable)
 ├── config/postgres/init/        # Database and warehouse schema bootstrap
-├── docker/
-│   ├── airflow/Dockerfile       # runtime + test stages, both used by CI
-│   └── data_generator/Dockerfile
-├── scripts/
-│   ├── provision_metabase.py    # `python -m scripts.provision_metabase`
-│   └── gen_secrets.sh           # Replaces the placeholder secrets in .env
+├── docker/                      # Dockerfiles (runtime + test stages)
+├── scripts/                     # Metabase provisioning, secret generation
 ├── tests/unit/                  # Transform rules and DAG integrity
 ├── tests/integration/           # End-to-end data flow validation
 ├── .github/workflows/main.yml   # CI/CD pipeline
@@ -346,4 +239,3 @@ interpreter: `make test PY=python3.12`.
 ├── requirements-dev.txt         # One toolchain for local and CI
 └── .env.example                 # Configuration template
 ```
-
