@@ -8,6 +8,11 @@ x-airflow-common: &airflow-common
   build:
     context: .
     dockerfile: docker/airflow/Dockerfile
+    # Without this, Docker builds the LAST stage in the file by default. The
+    # Dockerfile has a "test" stage after "runtime" (pytest + test files, used
+    # only by the CI "dags" job), so every service here would otherwise run
+    # that image instead of the clean runtime one.
+    target: runtime
   # AIRFLOW_IMAGE lets a deploy point compose at an already-published
   # artifact (`docker compose up --no-build`) instead of building locally.
   image: ${AIRFLOW_IMAGE:-mini-data-platform/airflow}:${IMAGE_TAG:-local}
