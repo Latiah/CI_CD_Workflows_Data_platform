@@ -125,8 +125,14 @@ def sales_ingestion():
         finally:
             conn.close()
 
-        # Move the object aside so the landing zone stays small and the sensor
-        # keeps reacting to genuinely new arrivals.
+        # Move the object aside so the landing zone stays small.
+        #
+        # This used to swallow failures with LOG.warning. That was wrong: the
+        # copy would succeed, the delete would fail, and the run reported
+        # success while leaving the object in the landing zone - surfacing much
+        # later as a confusing "file was not archived" failure with no error
+        # anywhere. Raising is safe: the load is already committed and
+        # ops.ingested_files makes a retry idempotent.
         try:
             s3.copy_object(
                 source_bucket_key=object_key,
@@ -134,9 +140,14 @@ def sales_ingestion():
                 source_bucket_name=BUCKET,
                 dest_bucket_name=ARCHIVE_BUCKET,
             )
-            s3.delete_objects(bucket=BUCKET, keys=[object_key])
-        except Exception as exc:  # archiving must never lose a successful load
-            LOG.warning("Could not archive %s: %s", object_key, exc)
+            # delete_object (singular) rather than the hook's delete_objects:
+            # the batch DeleteObjects API sends a checksummed request body that
+            # S3-compatible stores such as MinIO can reject, and recent botocore
+            # releases changed when those checksums are sent.
+            s3.get_conn().delete_object(Bucket=BUCKET, Key=object_key)
+        except Exception:
+            LOG.exception("Failed to archive %s from %s to %s", object_key, BUCKET, ARCHIVE_BUCKET)
+            raise
 
         return {"object_key": object_key, "rows_inserted": inserted, **summary}
 

@@ -204,6 +204,12 @@ def ingestion_record(key: str) -> tuple | None:
         return cursor.fetchone()
 
 
+def active_dag_runs() -> int:
+    """How many runs of this DAG are still queued or running."""
+    payload = airflow_request("GET", f"/api/v2/dags/{DAG_ID}/dagRuns?state=queued&state=running&limit=1")
+    return int(payload.get("total_entries", 0))
+
+
 def failed_task_report(run_id: str) -> str:
     tasks = airflow_request("GET", f"/api/v2/dags/{DAG_ID}/dagRuns/{run_id}/taskInstances")
     instances = tasks["task_instances"]
@@ -255,6 +261,17 @@ def dag_run(uploaded_batch):
             f"{key} was never recorded in ops.ingested_files after "
             f"{DAG_RUN_TIMEOUT}s.\n{failed_task_report(run_id)}"
         )
+
+    # The ingestion record is committed *before* the object is archived, so the
+    # row appearing does not mean the run has finished. Wait for the DAG to go
+    # quiet, otherwise assertions about the landing zone race the archive step.
+    settled = wait_until(
+        lambda: active_dag_runs() == 0,
+        timeout=DAG_RUN_TIMEOUT,
+        interval=5,
+        description="all DAG runs to finish so archiving has completed",
+    )
+    assert settled
 
     # It was ingested, so the pipeline works. A triggered run that then failed
     # still matters, so surface that rather than passing quietly.
