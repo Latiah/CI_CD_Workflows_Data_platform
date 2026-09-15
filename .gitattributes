@@ -1,8 +1,0 @@
-# Shell and SQL run inside Linux containers: a CRLF checkout on Windows breaks
-# them with "bad interpreter" or a syntax error, so pin them to LF regardless
-# of core.autocrlf.
-*.sh    text eol=lf
-*.sql   text eol=lf
-*.yml   text eol=lf
-*.yaml  text eol=lf
-Dockerfile text eol=lf
