@@ -100,6 +100,9 @@ x-airflow-common: &airflow-common
     # --- Pipeline tuning, read by the DAG ---
     MINIO_BUCKET: ${MINIO_BUCKET:-raw-data}
     MINIO_PREFIX: ${MINIO_PREFIX:-sales/}
+    # "none" makes the DAG manual-only. CI sets that so a scheduled run cannot
+    # consume the test's file before the test triggers its own run.
+    SALES_DAG_SCHEDULE: "${SALES_DAG_SCHEDULE:-*/10 * * * *}"
   volumes:
     - ./dags:/opt/airflow/dags:ro
     - ./src:/opt/airflow/src:ro

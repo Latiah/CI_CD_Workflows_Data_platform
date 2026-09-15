@@ -56,6 +56,24 @@ def test_task_graph_matches_the_documented_flow(dagbag):
     assert "process_file" in dag.get_task("summarise").upstream_task_ids
 
 
+def test_schedule_follows_the_environment(dagbag):
+    """The cadence is configurable so CI can run the DAG manual-only.
+
+    A scheduled run can otherwise consume an uploaded file before the
+    end-to-end suite triggers its own run, making that suite nondeterministic.
+    This guards the plumbing: hardcoding the cron again would fail here.
+    """
+    import os
+
+    dag = dagbag.dags[DAG_ID]
+    configured = os.environ.get("SALES_DAG_SCHEDULE", "*/10 * * * *").strip()
+    expected = None if configured.lower() in {"", "none", "manual"} else configured
+
+    assert (
+        dag.schedule == expected
+    ), f"SALES_DAG_SCHEDULE={configured!r} should give schedule={expected!r}, got {dag.schedule!r}"
+
+
 def test_dag_has_retries_and_no_catchup(dagbag):
     dag = dagbag.dags[DAG_ID]
 
