@@ -53,6 +53,18 @@ DEFAULT_ARGS = {
     default_args=DEFAULT_ARGS,
     dagrun_timeout=timedelta(minutes=30),
     tags=["minio", "postgres", "etl", "sales"],
+    # AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION=false (set for local/dev
+    # convenience) means every DAG comes up active the moment it's parsed. For
+    # a cron-scheduled DAG that races with the e2e test: on a fresh deploy the
+    # scheduler can fire its own automatic run before the test uploads its
+    # file, or between the upload and the test's own trigger - Airflow then
+    # correctly reports the test's run as a no-op (list_new_files finds
+    # nothing left to do) even though the file loaded fine via the other run.
+    # Overriding it here means nothing runs until it is explicitly unpaused -
+    # which the test already does right before it triggers - so the test owns
+    # timing deterministically. A real deployment unpauses it once, after
+    # which it behaves as a normal polling pipeline.
+    is_paused_upon_creation=True,
 )
 def sales_ingestion():
     # ------------------------------------------------------------ detect
