@@ -35,6 +35,14 @@ ARCHIVE_BUCKET = f"{BUCKET}-archive"
 PREFIX = os.environ.get("MINIO_PREFIX", "sales/")
 MAX_FILES_PER_RUN = int(os.environ.get("MAX_FILES_PER_RUN", "25"))
 
+# Normally every 10 minutes. Set SALES_DAG_SCHEDULE=none to make the DAG
+# manual-only, which CI does: otherwise a scheduled run can consume an uploaded
+# file in the gap before the test triggers its own run, and the test's run then
+# correctly finds nothing new. Harmless in production — ingestion is idempotent
+# — but it makes the end-to-end suite nondeterministic.
+_SCHEDULE = os.environ.get("SALES_DAG_SCHEDULE", "*/10 * * * *").strip()
+SCHEDULE = None if _SCHEDULE.lower() in {"", "none", "manual"} else _SCHEDULE
+
 DEFAULT_ARGS = {
     "owner": "data-platform",
     "retries": 2,
@@ -46,7 +54,7 @@ DEFAULT_ARGS = {
 @dag(
     dag_id="sales_ingestion",
     description="Ingest sales CSVs from MinIO, clean them, and load into PostgreSQL",
-    schedule="*/10 * * * *",
+    schedule=SCHEDULE,
     start_date=datetime(2024, 1, 1, tzinfo=UTC),
     catchup=False,
     max_active_runs=1,

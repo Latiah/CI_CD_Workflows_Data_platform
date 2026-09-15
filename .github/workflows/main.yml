@@ -106,6 +106,10 @@ jobs:
         run: |
           cp .env.example .env
           echo "AIRFLOW_UID=$(id -u)" >> .env
+          # Manual-only DAG: a scheduled run must not race the suite for the
+          # uploaded file. Ingestion is idempotent either way, but this keeps
+          # the end-to-end result deterministic.
+          echo "SALES_DAG_SCHEDULE=none" >> .env
           ./scripts/gen_secrets.sh
 
       # --wait blocks until every named service reports healthy, replacing a
@@ -241,6 +245,10 @@ jobs:
         run: |
           cp .env.example .env
           echo "AIRFLOW_UID=$(id -u)" >> .env
+          # Manual-only DAG: a scheduled run must not race the suite for the
+          # uploaded file. Ingestion is idempotent either way, but this keeps
+          # the end-to-end result deterministic.
+          echo "SALES_DAG_SCHEDULE=none" >> .env
           ./scripts/gen_secrets.sh
 
       - name: Deploy the published image

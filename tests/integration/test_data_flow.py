@@ -15,6 +15,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from contextlib import closing
 
 import boto3
 import psycopg2
@@ -188,9 +189,44 @@ def uploaded_batch(s3):
     return {"key": key, "rows_raw": len(rows), "expected": expected}
 
 
+def ingestion_record(key: str) -> tuple | None:
+    """The ops.ingested_files row for `key`, or None if not ingested yet.
+
+    Opens and closes its own connection: `with psycopg2.connect(...)` ends the
+    transaction but leaves the socket open, and this is polled on a loop.
+    """
+    with closing(psycopg2.connect(**PG_DSN)) as connection, connection.cursor() as cursor:
+        cursor.execute(
+            "SELECT rows_raw, rows_loaded, rows_rejected, dag_run_id "
+            "FROM ops.ingested_files WHERE object_key = %s",
+            (key,),
+        )
+        return cursor.fetchone()
+
+
+def failed_task_report(run_id: str) -> str:
+    tasks = airflow_request("GET", f"/api/v2/dags/{DAG_ID}/dagRuns/{run_id}/taskInstances")
+    instances = tasks["task_instances"]
+    states = [(t["task_id"], t.get("map_index", -1), t["state"]) for t in instances]
+    broken = [t for t in instances if t["state"] in {"failed", "up_for_retry"}]
+    logs = "\n\n".join(
+        f"----- {t['task_id']}[{t.get('map_index', -1)}] log -----\n{task_log(run_id, t)}" for t in broken
+    )
+    return f"Task states: {states}\n\n{logs or '<no failed task instances>'}"
+
+
 @pytest.fixture(scope="session")
 def dag_run(uploaded_batch):
-    """Processing step: trigger the DAG and wait for it to finish."""
+    """Processing step: make the platform ingest the uploaded file.
+
+    The assertion is that *the platform* ingested this object, not that one
+    particular DAG run did the work. The DAG is scheduled every 10 minutes and
+    arrives unpaused, so a scheduled run can legitimately consume the file
+    between the upload and the run triggered here. When that happens the
+    triggered run correctly finds nothing new and skips process_file - the
+    pipeline worked, and pinning the assertion to this run's task states made
+    the suite fail intermittently for a success.
+    """
     wait_until(
         lambda: http_json(f"{AIRFLOW_URL}/api/v2/monitor/health")["scheduler"]["status"] == "healthy",
         timeout=300,
@@ -198,31 +234,35 @@ def dag_run(uploaded_batch):
         description="the Airflow scheduler to report healthy",
     )
 
+    key = uploaded_batch["key"]
     airflow_request("PATCH", f"/api/v2/dags/{DAG_ID}", {"is_paused": False})
     run_id = f"e2e__{uuid.uuid4().hex[:8]}"
     airflow_request("POST", f"/api/v2/dags/{DAG_ID}/dagRuns", trigger_body(run_id))
 
-    def finished():
-        state = airflow_request("GET", f"/api/v2/dags/{DAG_ID}/dagRuns/{run_id}")["state"]
-        return state if state in {"success", "failed"} else None
+    # Whichever run picks the file up, ops.ingested_files is the proof it landed.
+    deadline = time.time() + DAG_RUN_TIMEOUT
+    record = None
+    while time.time() < deadline:
+        record = ingestion_record(key)
+        if record:
+            break
+        time.sleep(10)
 
-    state = wait_until(finished, timeout=DAG_RUN_TIMEOUT, interval=10, description=f"DAG run {run_id}")
-    tasks = airflow_request("GET", f"/api/v2/dags/{DAG_ID}/dagRuns/{run_id}/taskInstances")
-    states = [(t["task_id"], t["state"]) for t in tasks["task_instances"]]
-
-    broken = [t for t in tasks["task_instances"] if t["state"] in {"failed", "up_for_retry"}]
-    # A run where every task skipped also reports "success", and a failed
-    # non-leaf task used to as well. Either way the pipeline loaded nothing, so
-    # report the task logs rather than just the states.
-    processed = [s for task_id, s in states if task_id == "process_file" and s == "success"]
-
-    if state != "success" or broken or not processed:
-        logs = "\n\n".join(
-            f"----- {t['task_id']}[{t.get('map_index', -1)}] log -----\n{task_log(run_id, t)}" for t in broken
-        )
+    if not record:
+        # Report against the run we triggered - it is the one we can name, and
+        # its logs are the best evidence of why nothing was ingested.
         pytest.fail(
-            f"DAG run {run_id} ended as {state} and did not load the file.\n"
-            f"Task states: {states}\n\n{logs or '<no failed task instances to show>'}"
+            f"{key} was never recorded in ops.ingested_files after "
+            f"{DAG_RUN_TIMEOUT}s.\n{failed_task_report(run_id)}"
+        )
+
+    # It was ingested, so the pipeline works. A triggered run that then failed
+    # still matters, so surface that rather than passing quietly.
+    state = airflow_request("GET", f"/api/v2/dags/{DAG_ID}/dagRuns/{run_id}")["state"]
+    if state == "failed":
+        pytest.fail(
+            f"{key} was ingested (record: {record}) but the triggered run "
+            f"{run_id} failed.\n{failed_task_report(run_id)}"
         )
     return run_id
 
