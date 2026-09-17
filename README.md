@@ -8,57 +8,43 @@ warehouse, and Metabase charts the result — with CI/CD that proves the whole
 path still works on every commit.
 
 ```mermaid
-flowchart TB
-    subgraph net["docker network &middot; data-platform"]
+flowchart LR
+    GEN["<b>Data Generator</b><br/>makes sales records"]
+
+    subgraph FILES["MinIO &middot; file storage"]
         direction TB
-
-        GEN["<b>data_generator</b><br/>synthetic sales CSV<br/><i>~4% rows defective on purpose</i>"]
-
-        subgraph OBJ["MinIO &middot; S3-compatible object storage"]
-            direction LR
-            RAW[("<b>raw-data</b><br/>sales/*.csv<br/><i>landing zone</i>")]
-            ARCH[("<b>raw-data-archive</b><br/><i>processed files</i>")]
-        end
-
-        subgraph AIR["Apache Airflow 3.3 &middot; LocalExecutor"]
-            direction TB
-            DAGP["<b>dag-processor</b><br/>parses dags/ into<br/>serialised DAGs"]
-            SCHED["<b>scheduler</b><br/>decides what runs,<br/>and runs it"]
-            APIS["<b>api-server</b><br/>UI &middot; REST v2<br/>Task Execution API"]
-        end
-
-        subgraph DB["PostgreSQL 16"]
-            direction LR
-            ANL[("<b>analytics</b><br/>sales &middot; sales_rejects<br/>ops.ingested_files")]
-            AFM[("<b>airflow</b><br/>task state")]
-            MBM[("<b>metabase</b><br/>saved charts")]
-        end
-
-        MBASE["<b>Metabase</b><br/>KPI dashboards<br/><i>6 pre-built views</i>"]
+        INBOX[("<b>Incoming</b><br/>new files wait here")]
+        DONE[("<b>Archive</b><br/>files already handled")]
     end
 
-    GEN         -->|"upload"| RAW
-    RAW         -.->|"① list what is new"| SCHED
-    RAW         -->|"② download"| SCHED
-    SCHED       -->|"③ clean + load"| ANL
-    SCHED       -->|"④ archive, then delete"| ARCH
-    ANL         -->|"⑤ query views"| MBASE
+    FLOW["<b>Airflow</b><br/>the worker.<br/>checks for new files,<br/>cleans them, files them away"]
 
-    SCHED       <-.->|"fetch connections,<br/>report state"| APIS
-    DAGP        -.-> AFM
-    SCHED       -.-> AFM
-    APIS        -.-> AFM
-    MBASE       -.-> MBM
+    subgraph STORE["PostgreSQL &middot; the database"]
+        direction TB
+        GOOD[("<b>Clean sales</b>")]
+        BAD[("<b>Rejected rows</b><br/>kept, with the reason")]
+    end
 
-    classDef store fill:#e8f4f8,stroke:#2b6a8f,color:#0b2b3a
-    classDef compute fill:#f3f0fb,stroke:#6b4fa8,color:#241a3d
-    classDef edge fill:#fff6e8,stroke:#b8761a,color:#3d2708
-    class RAW,ARCH,ANL,AFM,MBM store
-    class DAGP,SCHED,APIS compute
-    class GEN,MBASE edge
+    CHARTS["<b>Metabase</b><br/>dashboards and charts"]
+
+    GEN    -->|"1&nbsp; drops a file"| INBOX
+    INBOX  -->|"2&nbsp; picks it up"| FLOW
+    FLOW   -->|"3&nbsp; good rows"| GOOD
+    FLOW   -->|"3&nbsp; bad rows"| BAD
+    FLOW   -->|"4&nbsp; moves the file aside"| DONE
+    GOOD   -->|"5&nbsp; reads it to draw charts"| CHARTS
+
+    classDef store fill:#ffffff,stroke:#111111,color:#111111,stroke-width:1px
+    classDef work fill:#ffffff,stroke:#111111,color:#111111,stroke-width:3px
+    classDef ends fill:#f4f4f4,stroke:#111111,color:#111111,stroke-width:1px,stroke-dasharray:4 3
+    class INBOX,DONE,GOOD,BAD store
+    class FLOW work
+    class GEN,CHARTS ends
 ```
 
-Solid arrows are the data path; dotted arrows are control and bookkeeping.
+Each file travels left to right: it arrives, gets checked and cleaned, the
+good rows are stored, the bad rows are set aside with a reason, and the charts
+read from the result.
 
 | Component | Technology | Purpose | URL |
 | :-- | :-- | :-- | :-- |
@@ -200,49 +186,27 @@ three tiers — fast checks first, then the real stack, then deployment:
 
 ```mermaid
 flowchart LR
-    PUSH(["push / PR"])
+    PUSH(["You push a change"])
+    CHECK["<b>Quick checks</b><br/>is the code tidy,<br/>do the rules still work?"]
+    PROVE["<b>Build the whole platform</b><br/>and push a real file<br/>all the way through it"]
+    PACK["<b>Package it</b><br/>stamped with this exact change"]
+    SHIP["<b>Deploy to a test environment</b><br/>and prove data still flows"]
+    OK(["Ready to use"])
 
-    subgraph FAST["Fast tier &middot; no services, under ~2 min"]
-        direction TB
-        LINT["<b>lint</b><br/>ruff + hadolint<br/>compose + SQL valid"]
-        UNIT["<b>unit</b><br/>transform rules<br/>12 tests, no Docker"]
-        DAGS["<b>dags</b><br/>parse the DAG bag<br/><i>inside the real Airflow image</i>"]
-    end
+    PUSH --> CHECK --> PROVE --> PACK --> SHIP --> OK
 
-    subgraph REAL["Integration tier &middot; the whole platform"]
-        INTEG["<b>integration</b><br/>compose up --wait<br/>provision Metabase<br/><i>MinIO → Airflow → Postgres → Metabase</i>"]
-    end
-
-    subgraph SHIP["Deployment &middot; main branch only"]
-        direction TB
-        PUB["<b>publish</b><br/>build runtime stage<br/>push ghcr.io/…:sha-&lt;commit&gt;"]
-        DEP["<b>deploy-test</b><br/>pull that exact tag<br/>deploy --no-build<br/>re-run the suite"]
-    end
-
-    OK(["test environment<br/>running the proven artifact"])
-
-    PUSH --> LINT
-    PUSH --> UNIT
-    PUSH --> DAGS
-    LINT --> INTEG
-    UNIT --> INTEG
-    DAGS --> INTEG
-    INTEG --> PUB
-    PUB --> DEP
-    DEP --> OK
-
-    classDef fast fill:#eef7ee,stroke:#3f7d3f,color:#12300f
-    classDef real fill:#fff6e8,stroke:#b8761a,color:#3d2708
-    classDef ship fill:#f3f0fb,stroke:#6b4fa8,color:#241a3d
-    class LINT,UNIT,DAGS fast
-    class INTEG real
-    class PUB,DEP ship
+    classDef step fill:#ffffff,stroke:#111111,color:#111111,stroke-width:1px
+    classDef key fill:#ffffff,stroke:#111111,color:#111111,stroke-width:3px
+    classDef ends fill:#f4f4f4,stroke:#111111,color:#111111,stroke-width:1px,stroke-dasharray:4 3
+    class CHECK,PACK,SHIP step
+    class PROVE key
+    class PUSH,OK ends
 ```
 
-A failure in the fast tier stops everything before a single container starts,
-and nothing is published unless data has actually moved end to end.
+Nothing gets packaged or deployed unless data has actually travelled the whole
+path first.
 
-The six jobs in detail:
+The six jobs behind those steps:
 
 | Tier | Job | What it does |
 | :-- | :-- | :-- |
