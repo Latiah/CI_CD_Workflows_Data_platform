@@ -8,6 +8,19 @@ PY ?= python
 # (nothing defers) and the generator is on-demand.
 CORE_SERVICES := postgres minio airflow-apiserver airflow-scheduler airflow-dag-processor metabase
 
+# Host-facing endpoints, derived from .env so the targets follow a remapped
+# stack. Without this, `make metabase` and `make e2e` always knocked on the
+# default ports and failed with "connection refused" whenever .env published
+# the services somewhere else. CI never saw it because CI uses the defaults.
+-include .env
+METABASE_URL   ?= http://localhost:$(or $(METABASE_PORT),3000)
+AIRFLOW_URL    ?= http://localhost:$(or $(AIRFLOW_PORT),8080)
+MINIO_ENDPOINT ?= http://localhost:$(or $(MINIO_API_PORT),9000)
+POSTGRES_PORT  ?= 5432
+export METABASE_URL AIRFLOW_URL MINIO_ENDPOINT POSTGRES_PORT
+export MINIO_BUCKET MINIO_PREFIX METABASE_ADMIN_EMAIL METABASE_ADMIN_PASSWORD
+export AIRFLOW_ADMIN_USER AIRFLOW_ADMIN_PASSWORD POSTGRES_USER POSTGRES_PASSWORD ANALYTICS_DB
+
 .PHONY: help env up down restart build logs ps seed seed-loop metabase \
         lint validate test e2e clean smoke
 
@@ -46,9 +59,9 @@ e2e: ## End-to-end data flow validation against the running stack
 up: ## Build and start the platform, waiting until every service is healthy
 	$(COMPOSE) up -d --build --wait --wait-timeout 600 $(CORE_SERVICES)
 	@echo ""
-	@echo "  Airflow   http://localhost:8080  (airflow / airflow)"
-	@echo "  MinIO     http://localhost:9001  (minioadmin / minioadmin)"
-	@echo "  Metabase  http://localhost:3000"
+	@echo "  Airflow   $(AIRFLOW_URL)"
+	@echo "  MinIO     http://localhost:$(or $(MINIO_CONSOLE_PORT),9001)"
+	@echo "  Metabase  $(METABASE_URL)"
 	@echo ""
 	@echo "  Next:  make metabase   then   make seed"
 

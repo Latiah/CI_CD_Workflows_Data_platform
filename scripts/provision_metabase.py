@@ -61,34 +61,50 @@ def wait_for_metabase(attempts: int = 60, delay: int = 5) -> None:
 
 
 def session_token() -> str:
-    """Run first-time setup if needed, otherwise log in."""
+    """Log in, falling back to first-time setup on a fresh instance.
+
+    Login is tried first deliberately. Keying off the `setup-token` property
+    instead looked cleaner but is unreliable: an already-provisioned Metabase
+    can still report a token, and POSTing /api/setup then fails with a bare
+    403 Forbidden. Whether we can sign in is the question that actually
+    matters, so ask that one.
+    """
+    try:
+        token = request("POST", "/api/session", {"username": ADMIN_EMAIL, "password": ADMIN_PASSWORD})["id"]
+        print(f"Signed in as {ADMIN_EMAIL} (already provisioned).")
+        return token
+    except urllib.error.HTTPError as exc:
+        if exc.code not in (400, 401):
+            raise
+        print("Could not sign in; running first-time setup...")
+
     properties = request("GET", "/api/session/properties")
     setup_token = properties.get("setup-token")
-
-    if setup_token:
-        print("Running Metabase first-time setup...")
-        result = request(
-            "POST",
-            "/api/setup",
-            {
-                "token": setup_token,
-                "user": {
-                    "email": ADMIN_EMAIL,
-                    "password": ADMIN_PASSWORD,
-                    "first_name": "Platform",
-                    "last_name": "Admin",
-                    "site_name": "Mini Data Platform",
-                },
-                "prefs": {"site_name": "Mini Data Platform", "allow_tracking": False},
-            },
+    if not setup_token:
+        raise SystemExit(
+            f"Cannot sign in as {ADMIN_EMAIL} and Metabase offers no setup token. "
+            "It is already provisioned with different credentials - set "
+            "METABASE_ADMIN_EMAIL / METABASE_ADMIN_PASSWORD to match, or run "
+            "`make clean` to start from an empty volume."
         )
-        token = result.get("id")
-        if token:
-            print(f"Admin account created: {ADMIN_EMAIL}")
-            return token
 
-    print("Metabase already initialised; signing in.")
-    return request("POST", "/api/session", {"username": ADMIN_EMAIL, "password": ADMIN_PASSWORD})["id"]
+    result = request(
+        "POST",
+        "/api/setup",
+        {
+            "token": setup_token,
+            "user": {
+                "email": ADMIN_EMAIL,
+                "password": ADMIN_PASSWORD,
+                "first_name": "Platform",
+                "last_name": "Admin",
+                "site_name": "Mini Data Platform",
+            },
+            "prefs": {"site_name": "Mini Data Platform", "allow_tracking": False},
+        },
+    )
+    print(f"Admin account created: {ADMIN_EMAIL}")
+    return result["id"]
 
 
 def ensure_database(token: str) -> int:

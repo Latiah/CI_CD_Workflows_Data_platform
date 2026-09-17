@@ -15,10 +15,10 @@ path still works on every commit.
 
 | Component | Technology | Purpose | URL |
 | :-- | :-- | :-- | :-- |
-| Database | PostgreSQL 16 | Structured storage for processed data | `localhost:5432` |
-| Processing | Apache Airflow 3.3 | Orchestration and pipeline execution | http://localhost:8080 |
-| Storage | MinIO | S3-compatible object storage for raw CSVs | http://localhost:9001 |
-| Dashboards | Metabase | Charts and reporting | http://localhost:3000 |
+| Database | PostgreSQL 16 | Structured storage for processed data | `localhost:55432` |
+| Processing | Apache Airflow 3.3 | Orchestration and pipeline execution | http://localhost:18080 |
+| Storage | MinIO | S3-compatible object storage for raw CSVs | http://localhost:19001 |
+| Dashboards | Metabase | Charts and reporting | http://localhost:13000 |
 
 ---
 
